@@ -564,6 +564,8 @@ async def movie_help(interaction: discord.Interaction):
         value=("**/movie** — open a form (title, year, date, time, runtime) to "
                "create a scheduled event + announcement. *Only works in the "
                "configured mod channel.*\n"
+               "**/movie-test** — dry-run that checks config & permissions "
+               "without posting anything. Run this first.\n"
                "**/movie-cancel** — pick an upcoming movie night to delete its "
                "event **and** announcement (and the VRChat event if linked).\n"
                "**/movie-help** — show this guide."),
@@ -587,8 +589,119 @@ async def movie_help(interaction: discord.Interaction):
         name="First-time setup",
         value=("1. `/movie-config set` your channels.\n"
                "2. *(optional)* `/movie-vrchat link` your VRChat group.\n"
-               "3. `/movie` in the mod channel to schedule a night."),
+               "3. `/movie-test` to confirm I have the access I need.\n"
+               "4. `/movie` in the mod channel to schedule a night."),
         inline=False)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@tree.command(name="movie-test",
+              description="Dry-run: check the bot's config & permissions without posting anything.")
+@app_commands.guild_only()
+@app_commands.default_permissions(manage_events=True)
+async def movie_test(interaction: discord.Interaction):
+    guild = interaction.guild
+    me = guild.me
+    conf = gconf(guild.id)
+    lines = []
+    ok_all = True
+
+    def mark(ok, text):
+        nonlocal ok_all
+        if not ok:
+            ok_all = False
+        return f"{'✅' if ok else '❌'} {text}"
+
+    # 1. Configuration present
+    needed = {
+        "mod_channel_id": "Mod channel",
+        "announce_channel_id": "Announcements channel",
+        "voice_channel_id": "Movie voice channel",
+    }
+    missing = [label for key, label in needed.items() if key not in conf]
+    if missing:
+        lines.append(mark(False, "Configuration: missing " + ", ".join(missing)
+                          + " — run `/movie-config set`."))
+        embed = discord.Embed(
+            title="🎬 Movie Night — setup test",
+            description="\n".join(lines), color=0xED4245)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+        return
+    lines.append(mark(True, "Configuration is set."))
+
+    # 2. Guild-level: Manage Events
+    lines.append(mark(me.guild_permissions.manage_events,
+                      "**Manage Events** permission (to create scheduled events)."))
+
+    # 3. Announcements channel — view + post
+    announce = guild.get_channel(conf["announce_channel_id"])
+    if announce is None:
+        lines.append(mark(False, "Announcements channel not found (re-run `/movie-config set`)."))
+    else:
+        p = announce.permissions_for(me)
+        sub = []
+        sub.append(("View Channel", p.view_channel))
+        sub.append(("Send Messages", p.send_messages))
+        sub.append(("Embed Links", p.embed_links))
+        sub.append(("Attach Files", p.attach_files))
+        bad = [n for n, v in sub if not v]
+        lines.append(mark(not bad,
+                          f"Announcements {announce.mention}: "
+                          + ("all good." if not bad else "missing " + ", ".join(bad) + ".")))
+
+    # 4. Voice channel — view (needed for the scheduled event)
+    voice = guild.get_channel(conf["voice_channel_id"])
+    if voice is None:
+        lines.append(mark(False, "Movie voice channel not found (re-run `/movie-config set`)."))
+    else:
+        p = voice.permissions_for(me)
+        lines.append(mark(p.view_channel,
+                          f"Movie voice channel **{voice.name}**: "
+                          + ("visible." if p.view_channel else "I can't see it (need View Channel).")))
+
+    # 5. Mod channel — view (where /movie is used)
+    mod = guild.get_channel(conf["mod_channel_id"])
+    if mod is None:
+        lines.append(mark(False, "Mod channel not found (re-run `/movie-config set`)."))
+    else:
+        p = mod.permissions_for(me)
+        lines.append(mark(p.view_channel,
+                          f"Mod channel {mod.mention}: "
+                          + ("visible." if p.view_channel else "I can't see it (need View Channel).")))
+
+    # 6. Ping role (optional)
+    if conf.get("ping_role_id"):
+        role = guild.get_role(conf["ping_role_id"])
+        if role is None:
+            lines.append(mark(False, "Configured ping role no longer exists — update with `/movie-config set`."))
+        elif role.is_default():
+            lines.append(mark(True, "Ping role: @everyone (handled specially)."))
+        else:
+            can_ping = role.mentionable or me.guild_permissions.mention_everyone
+            lines.append(mark(can_ping,
+                              f"Ping role {role.mention}: "
+                              + ("can be pinged." if can_ping
+                                 else "may not ping (role isn't mentionable and I lack Mention @everyone).")))
+    else:
+        lines.append("ℹ️ No ping role configured (announcements won't @-mention).")
+
+    # 7. VRChat (optional)
+    vconf_g = vconf(guild.id)
+    if vconf_g.get("group_id") and vconf_g.get("auth_cookie"):
+        gname = vconf_g.get("display_name") or vconf_g.get("group_id")
+        lines.append(f"ℹ️ VRChat linked ({gname}) — movie nights will also post to its calendar.")
+    else:
+        lines.append("ℹ️ VRChat not linked (optional).")
+
+    title = "🎬 Movie Night — setup test"
+    if ok_all:
+        lines.append("\n**All required checks passed — you're ready to run `/movie`.** 🎉")
+        color = 0x57F287
+    else:
+        lines.append("\n**Some checks failed.** Fix the ❌ items above, then run `/movie-test` again.")
+        color = 0xED4245
+    embed = discord.Embed(title=title, description="\n".join(lines), color=color)
+    embed.set_footer(text="This is a dry run — nothing was posted and no event was created.")
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 

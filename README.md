@@ -16,6 +16,9 @@ own channels, ping role and timezone.
 - **`/movie`** — opens a form (title / year / date / time / runtime), then:
   - creates a Discord scheduled event (with a 16:9 backdrop image when found), and
   - posts a styled announcement, optionally pinging a configurable role.
+- **`/movie-test`** — dry-run that verifies config and all required permissions
+  (Manage Events, channel visibility, send/embed/attach, ping role) **without**
+  posting anything. Run this before the first real `/movie`.
 - **`/movie-cancel`** — autocompletes this server's upcoming movie nights and
   deletes **both** the scheduled event and the announcement message.
 - **`/movie-help`** — posts an ephemeral guide listing every command and what it does.
