@@ -18,6 +18,7 @@ own channels, ping role and timezone.
   - posts a styled announcement, optionally pinging a configurable role.
 - **`/movie-cancel`** — autocompletes this server's upcoming movie nights and
   deletes **both** the scheduled event and the announcement message.
+- **`/movie-help`** — posts an ephemeral guide listing every command and what it does.
 - **`/movie-config set | show | clear`** — per-guild configuration.
 - **AI content** via the [GitHub Copilot CLI](https://github.com/github/copilot-cli):
   the bot shells out to `copilot -p ... --silent` to write the announcement and

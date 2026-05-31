@@ -549,6 +549,49 @@ async def movie(interaction: discord.Interaction):
     await interaction.response.send_modal(MovieModal(conf))
 
 
+@tree.command(name="movie-help",
+              description="List all movie-night commands and what they do.")
+@app_commands.guild_only()
+@app_commands.default_permissions(manage_events=True)
+async def movie_help(interaction: discord.Interaction):
+    embed = discord.Embed(
+        title="🎬 Movie Night — command guide",
+        description="All commands need the **Manage Events** permission and are "
+                    "used in your server.",
+        color=0x5865F2)
+    embed.add_field(
+        name="Scheduling",
+        value=("**/movie** — open a form (title, year, date, time, runtime) to "
+               "create a scheduled event + announcement. *Only works in the "
+               "configured mod channel.*\n"
+               "**/movie-cancel** — pick an upcoming movie night to delete its "
+               "event **and** announcement (and the VRChat event if linked).\n"
+               "**/movie-help** — show this guide."),
+        inline=False)
+    embed.add_field(
+        name="Configuration  ·  /movie-config",
+        value=("**set** — set the mod channel, announcements channel, movie "
+               "voice channel, optional ping role and timezone (any subset).\n"
+               "**show** — show this server's current configuration.\n"
+               "**clear** — wipe the configuration to start fresh."),
+        inline=False)
+    embed.add_field(
+        name="VRChat (optional)  ·  /movie-vrchat",
+        value=("**link** — link a VRChat account + group (one-time) so movie "
+               "nights also post to its calendar.\n"
+               "**status** — show the linked account/group and check the "
+               "session.\n"
+               "**unlink** — remove the VRChat link and stored session."),
+        inline=False)
+    embed.add_field(
+        name="First-time setup",
+        value=("1. `/movie-config set` your channels.\n"
+               "2. *(optional)* `/movie-vrchat link` your VRChat group.\n"
+               "3. `/movie` in the mod channel to schedule a night."),
+        inline=False)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
 async def _cancel_autocomplete(interaction: discord.Interaction, current: str):
     recs = upcoming_records(interaction.guild_id)
     cur = current.lower()
