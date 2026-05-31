@@ -3,6 +3,7 @@ token
 config.json
 guilds.json
 events.json
+vrchat.json
 bot.log
 
 # Scratch

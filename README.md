@@ -23,6 +23,9 @@ own channels, ping role and timezone.
   the bot shells out to `copilot -p ... --silent` to write the announcement and
   a synopsis + fun facts for the event. Falls back to a plain template if
   Copilot isn't available (toggle with `use_copilot` in `config.json`).
+- **VRChat group calendar (optional):** if a server links a VRChat group, each
+  movie night also creates a **VRChat group calendar event**, and `/movie-cancel`
+  removes it too. See [VRChat integration](#vrchat-integration-optional).
 
 ---
 
@@ -49,6 +52,7 @@ Per-guild state lives in JSON files next to `bot.py`:
 | `config.json` | global defaults | no |
 | `guilds.json` | per-guild channel/role/tz config | no |
 | `events.json` | scheduled events the bot created (for cancel) | no |
+| `vrchat.json` | per-guild VRChat session cookies + linked group | no (chmod 600) |
 | `bot.log` | runtime log | no |
 
 ---
@@ -173,6 +177,60 @@ Now schedule one (must be run in the configured mod channel):
   `guilds`. It never reads message content.
 - Secrets (`token`) and per-instance state are gitignored. Use
   `MOVIE_BOT_TOKEN` to keep the token out of the filesystem entirely.
+
+---
+
+## VRChat integration (optional)
+
+If a server runs movie nights inside a VRChat **group**, the bot can also create
+a matching event on that group's **calendar** — and remove it when you cancel.
+
+### How linking works
+
+VRChat has **no OAuth**, so the only way to get a session is username + password
++ 2FA. Linking is therefore a one-time, self-service flow per server:
+
+1. A mod runs **`/movie-vrchat link`**.
+2. A modal asks for the VRChat **username**, **password**, **group ID**
+   (`grp_…`) and an optional event **category** (default `film_media`).
+3. If the account has 2FA, the bot replies with an *Enter 2FA code* button →
+   another modal collects the email/authenticator code.
+4. The bot verifies and stores **only the resulting session cookies** (in
+   `vrchat.json`, `chmod 600`) — **never the password**.
+
+```mermaid
+flowchart TD
+    A[/movie-vrchat link/] --> B[Modal: username, password, group ID, category]
+    B --> C{2FA required?}
+    C -- no --> E[Store session cookies]
+    C -- yes --> D[Button → 2FA code modal → verify]
+    D --> E
+    E --> F[(vrchat.json, chmod 600)]
+```
+
+### Commands
+
+| Command | What it does |
+| --- | --- |
+| `/movie-vrchat link` | start the credential + 2FA flow (one-time per server) |
+| `/movie-vrchat status` | show the linked account/group and check if the session is still valid |
+| `/movie-vrchat unlink` | delete the stored session and group link |
+
+Once linked, every `/movie` also creates a VRChat group calendar event
+(`POST /calendar/{groupId}/event`) using the movie's title, AI synopsis, and
+start/end times; `/movie-cancel` deletes it (`DELETE /calendar/{groupId}/{calendarId}`).
+
+### Requirements & caveats
+
+- The linked VRChat account must be a **member of the group with permission to
+  manage calendar events**.
+- The VRChat API is **unofficial**. The bot sends a descriptive `User-Agent`
+  and makes only occasional calls; respect VRChat's rate limits and Terms.
+- Session cookies expire eventually — when they do, `/movie` and
+  `/movie-vrchat status` will say so; just run `/movie-vrchat link` again.
+- Discord modals don't mask the password field as you type, and the value
+  transits Discord's interaction payload to the bot. Only link an account you
+  control, on a bot host you trust. The bot stores **only** the session token.
 
 ---
 

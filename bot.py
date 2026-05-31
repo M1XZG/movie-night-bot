@@ -47,11 +47,14 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import discord
 from discord import app_commands
 
+import vrchat
+
 HERE = Path(__file__).resolve().parent
 TOKEN_FILE = HERE / "token"
 CONFIG_FILE = HERE / "config.json"
 GUILDS_FILE = HERE / "guilds.json"
 EVENTS_FILE = HERE / "events.json"
+VRC_FILE = HERE / "vrchat.json"
 LOG_FILE = HERE / "bot.log"
 
 # Bundled landscape-backdrop fetcher (ships alongside this file).
@@ -98,8 +101,13 @@ CFG = {**DEFAULTS, **load_json(CONFIG_FILE, {})}
 GUILDS = load_json(GUILDS_FILE, {})
 # Per-guild list of scheduled movie nights the bot created, so /movie-cancel can
 # remove both the event and the announcement message:
-#   { guild_id: [ {event_id, message_id, channel_id, title, unix}, ... ] }
+#   { guild_id: [ {event_id, message_id, channel_id, title, unix,
+#                  vrc_group_id?, vrc_event_id?}, ... ] }
 EVENTS = load_json(EVENTS_FILE, {})
+# Per-guild VRChat linkage (chmod 600 — session cookies, never the password):
+#   { guild_id: {group_id, auth_cookie, twofa_cookie, display_name,
+#                category, access_type, send_notification, linked_by, linked_at} }
+VRC = load_json(VRC_FILE, {})
 
 
 def save_events() -> None:
@@ -129,6 +137,39 @@ def upcoming_records(guild_id: int) -> list:
         EVENTS[str(guild_id)] = kept
         save_events()
     return sorted(kept, key=lambda r: r.get("unix", 0))
+
+
+def save_vrc() -> None:
+    try:
+        VRC_FILE.write_text(json.dumps(VRC, indent=2) + "\n")
+        try:
+            os.chmod(VRC_FILE, 0o600)
+        except OSError:
+            pass
+    except OSError as e:
+        log(f"WARN: could not write vrchat.json: {e}")
+
+
+def vconf(guild_id: int) -> dict:
+    return VRC.get(str(guild_id), {})
+
+
+def set_vconf(guild_id: int, data: dict) -> None:
+    VRC.setdefault(str(guild_id), {}).update(data)
+    save_vrc()
+
+
+def clear_vconf(guild_id: int) -> bool:
+    if str(guild_id) in VRC:
+        del VRC[str(guild_id)]
+        save_vrc()
+        return True
+    return False
+
+
+def vrc_cookies(conf: dict) -> dict:
+    return {"auth": conf.get("auth_cookie"),
+            "twoFactorAuth": conf.get("twofa_cookie")}
 
 
 def gconf(guild_id: int) -> dict:
@@ -438,17 +479,49 @@ class MovieModal(discord.ui.Modal, title="Schedule a Movie Night"):
                 ephemeral=True)
             return
 
-        add_event_record(guild.id, {
+        record = {
             "event_id": event.id,
             "message_id": msg.id,
             "channel_id": announce.id,
             "title": title,
             "unix": unix,
-        })
+        }
+
+        # Optional: also create a VRChat group calendar event (best-effort).
+        vrc_note = ""
+        vconf_g = vconf(guild.id)
+        if vconf_g.get("group_id") and vconf_g.get("auth_cookie"):
+            starts = start_dt.astimezone(dt.timezone.utc).strftime(
+                "%Y-%m-%dT%H:%M:%SZ")
+            ends = end_dt.astimezone(dt.timezone.utc).strftime(
+                "%Y-%m-%dT%H:%M:%SZ")
+            payload = vrchat.build_event_payload(
+                f"Movie Night: {title}", event_desc, starts, ends,
+                category=vconf_g.get("category", "film_media"),
+                access_type=vconf_g.get("access_type", "group"),
+                send_notification=vconf_g.get("send_notification", True))
+            try:
+                ev = await vrchat.create_event(
+                    vrc_cookies(vconf_g), vconf_g["group_id"], payload)
+                cal_id = ev.get("id")
+                record["vrc_group_id"] = vconf_g["group_id"]
+                record["vrc_event_id"] = cal_id
+                vrc_note = "\n:globe_with_meridians: Also posted to the VRChat group calendar."
+                log(f"VRChat event created for guild {guild.id}: {cal_id}")
+            except vrchat.VRChatAuthError:
+                vrc_note = ("\n:warning: VRChat session expired — run "
+                            "`/movie-vrchat link` to re-link. (Discord event still created.)")
+                log(f"VRChat auth expired for guild {guild.id}")
+            except vrchat.VRChatError as e:
+                vrc_note = f"\n:warning: VRChat calendar event failed: {e.message}"
+                log(f"VRChat event failed for guild {guild.id}: {e.message}")
+
+        add_event_record(guild.id, record)
 
         await interaction.followup.send(
             f"✅ Scheduled **{title}** for <t:{unix}:F>, created the event, and "
-            f"announced it in {announce.mention}.\n{event_url}", ephemeral=True)
+            f"announced it in {announce.mention}.\n{event_url}{vrc_note}",
+            ephemeral=True)
         log(f"/movie by {interaction.user} in guild {guild.id}: "
             f"'{title}' @ {start_dt.isoformat()} event={event.id}")
 
@@ -552,6 +625,20 @@ async def movie_cancel(interaction: discord.Interaction, movie: str):
     except discord.HTTPException as e:
         notes.append(f"⚠️ announcement delete failed: {e}")
 
+    # Delete the linked VRChat calendar event, if any
+    if rec.get("vrc_event_id") and rec.get("vrc_group_id"):
+        vconf_g = vconf(interaction.guild_id)
+        if vconf_g.get("auth_cookie"):
+            try:
+                ok = await vrchat.delete_event(
+                    vrc_cookies(vconf_g), rec["vrc_group_id"], rec["vrc_event_id"])
+                notes.append("VRChat event deleted" if ok
+                             else "VRChat event already gone")
+            except vrchat.VRChatAuthError:
+                notes.append("⚠️ VRChat session expired (event not deleted)")
+            except vrchat.VRChatError as e:
+                notes.append(f"⚠️ VRChat delete failed: {e.message}")
+
     remove_event_record(interaction.guild_id, event_id)
     log(f"/movie-cancel by {interaction.user} in guild {guild.id}: "
         f"'{rec['title']}' event={event_id} ({'; '.join(notes)})")
@@ -653,6 +740,200 @@ def _format_conf(guild: discord.Guild, conf: dict) -> str:
 
 
 tree.add_command(config_group)
+
+
+# --------------------------------------------------------------------------- #
+# VRChat group-calendar linking (/movie-vrchat)
+# --------------------------------------------------------------------------- #
+# In-memory pending logins between the credentials modal and the 2FA modal.
+# Keyed by (guild_id, user_id) -> {auth, methods, group_id, category, expires}.
+PENDING_VRC: dict = {}
+PENDING_TTL = 600  # seconds
+
+
+def _prune_pending() -> None:
+    now = time.time()
+    for k in [k for k, v in PENDING_VRC.items() if v.get("expires", 0) < now]:
+        PENDING_VRC.pop(k, None)
+
+
+async def _store_vrc_session(interaction, group_id, category, auth, twofa):
+    """Validate the freshly-minted session and persist it for the guild."""
+    cookies = {"auth": auth, "twoFactorAuth": twofa}
+    try:
+        me = await vrchat.current_user(cookies)
+    except vrchat.VRChatError as e:
+        await interaction.followup.send(
+            f"⚠️ Linked but couldn't confirm the session: {e.message}",
+            ephemeral=True)
+        return
+    set_vconf(interaction.guild_id, {
+        "group_id": group_id,
+        "auth_cookie": auth,
+        "twofa_cookie": twofa,
+        "display_name": me.get("displayName"),
+        "category": category,
+        "access_type": "group",
+        "send_notification": True,
+        "linked_by": interaction.user.id,
+        "linked_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+    })
+    log(f"/movie-vrchat link by {interaction.user} in guild "
+        f"{interaction.guild_id}: {me.get('displayName')} -> {group_id}")
+    await interaction.followup.send(
+        f"✅ Linked VRChat account **{me.get('displayName')}** to group "
+        f"`{group_id}`. Movie nights will now also post to its calendar.\n"
+        "_Only the session token was stored — never your password._",
+        ephemeral=True)
+
+
+class VRC2FAModal(discord.ui.Modal, title="VRChat 2FA"):
+    code = discord.ui.TextInput(
+        label="2FA code", placeholder="6-digit code from your app or email",
+        min_length=6, max_length=8)
+
+    def __init__(self, pending_key):
+        super().__init__(timeout=300)
+        self.pending_key = pending_key
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        _prune_pending()
+        pending = PENDING_VRC.get(self.pending_key)
+        if not pending:
+            await interaction.followup.send(
+                "⚠️ That login attempt expired. Run `/movie-vrchat link` again.",
+                ephemeral=True)
+            return
+        method = pending["methods"][0]
+        try:
+            res = await vrchat.verify_2fa(
+                pending["auth"], method, self.code.value.strip())
+        except vrchat.VRChatError as e:
+            await interaction.followup.send(
+                f"⚠️ {e.message}", ephemeral=True)
+            return
+        PENDING_VRC.pop(self.pending_key, None)
+        await _store_vrc_session(
+            interaction, pending["group_id"], pending["category"],
+            res["auth"], res.get("twofa"))
+
+
+class VRC2FAView(discord.ui.View):
+    def __init__(self, pending_key, user_id):
+        super().__init__(timeout=300)
+        self.pending_key = pending_key
+        self.user_id = user_id
+
+    @discord.ui.button(label="Enter 2FA code", style=discord.ButtonStyle.primary)
+    async def enter_code(self, interaction: discord.Interaction,
+                         button: discord.ui.Button):
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message(
+                "This button isn't for you.", ephemeral=True)
+            return
+        await interaction.response.send_modal(VRC2FAModal(self.pending_key))
+
+
+class VRCLinkModal(discord.ui.Modal, title="Link VRChat account"):
+    username = discord.ui.TextInput(
+        label="VRChat username or email", max_length=100)
+    password = discord.ui.TextInput(
+        label="VRChat password (used once, not stored)", max_length=128)
+    group_id = discord.ui.TextInput(
+        label="VRChat group ID", placeholder="grp_xxxxxxxx-...", max_length=64)
+    category = discord.ui.TextInput(
+        label="Event category (optional)", required=False,
+        placeholder="film_media", max_length=20)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        gid = self.group_id.value.strip()
+        if not gid.startswith("grp_"):
+            await interaction.followup.send(
+                "⚠️ That doesn't look like a VRChat group ID (should start with "
+                "`grp_`).", ephemeral=True)
+            return
+        cat = (self.category.value or "").strip().lower() or "film_media"
+        if cat not in vrchat.VALID_CATEGORIES:
+            cat = "film_media"
+        try:
+            res = await vrchat.login(
+                self.username.value.strip(), self.password.value)
+        except vrchat.VRChatError as e:
+            await interaction.followup.send(f"⚠️ {e.message}", ephemeral=True)
+            return
+
+        if res["state"] == "ok":
+            await _store_vrc_session(
+                interaction, gid, cat, res["auth"], res.get("twofa"))
+            return
+
+        # 2FA required: stash the partial session and offer a button.
+        key = (interaction.guild_id, interaction.user.id)
+        PENDING_VRC[key] = {
+            "auth": res["auth"],
+            "methods": [m.lower() for m in res["methods"]],
+            "group_id": gid,
+            "category": cat,
+            "expires": time.time() + PENDING_TTL,
+        }
+        method = PENDING_VRC[key]["methods"][0]
+        how = ("your email" if method == "emailotp"
+               else "your authenticator app")
+        await interaction.followup.send(
+            f"🔐 VRChat needs a 2FA code from {how}. Click below to enter it.",
+            view=VRC2FAView(key, interaction.user.id), ephemeral=True)
+
+
+vrc_group = app_commands.Group(
+    name="movie-vrchat",
+    description="Link a VRChat group so movie nights post to its calendar.",
+    guild_only=True, default_permissions=discord.Permissions(manage_events=True))
+
+
+@vrc_group.command(name="link",
+                   description="Link this server's VRChat account + group (one-time).")
+async def vrc_link(interaction: discord.Interaction):
+    await interaction.response.send_modal(VRCLinkModal())
+
+
+@vrc_group.command(name="status",
+                   description="Show the linked VRChat account and check the session.")
+async def vrc_status(interaction: discord.Interaction):
+    conf = vconf(interaction.guild_id)
+    if not conf.get("group_id"):
+        await interaction.response.send_message(
+            "No VRChat group linked. Run `/movie-vrchat link`.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    valid = "unknown"
+    try:
+        me = await vrchat.current_user(vrc_cookies(conf))
+        valid = f"✅ active (as **{me.get('displayName')}**)"
+    except vrchat.VRChatAuthError:
+        valid = "⚠️ expired — run `/movie-vrchat link` to refresh"
+    except vrchat.VRChatError as e:
+        valid = f"⚠️ check failed: {e.message}"
+    await interaction.followup.send(
+        f"• **VRChat account:** {conf.get('display_name', '—')}\n"
+        f"• **Group:** `{conf['group_id']}`\n"
+        f"• **Category:** `{conf.get('category', 'film_media')}`\n"
+        f"• **Session:** {valid}", ephemeral=True)
+
+
+@vrc_group.command(name="unlink",
+                   description="Remove this server's VRChat link and stored session.")
+async def vrc_unlink(interaction: discord.Interaction):
+    cleared = clear_vconf(interaction.guild_id)
+    log(f"/movie-vrchat unlink by {interaction.user} in guild "
+        f"{interaction.guild_id}: cleared={cleared}")
+    await interaction.response.send_message(
+        "🧹 VRChat link removed and stored session deleted." if cleared
+        else "Nothing to unlink — no VRChat group is linked.", ephemeral=True)
+
+
+tree.add_command(vrc_group)
 
 
 @client.event
