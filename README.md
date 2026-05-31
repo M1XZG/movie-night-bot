@@ -1,0 +1,181 @@
+# 🎬 Movie Night Bot
+
+A focused, **least-privilege** Discord bot that lets server mods schedule movie
+nights. For each one it creates a native Discord **scheduled event** in the
+guild's movie voice channel and posts a whimsical **announcement** in the
+guild's announcements channel — both enriched with AI-generated content
+(synopsis, cast, director, fun facts).
+
+No `Administrator`. No privileged intents. Each server's mods configure their
+own channels, ping role and timezone.
+
+---
+
+## Features
+
+- **`/movie`** — opens a form (title / year / date / time / runtime), then:
+  - creates a Discord scheduled event (with a 16:9 backdrop image when found), and
+  - posts a styled announcement, optionally pinging a configurable role.
+- **`/movie-cancel`** — autocompletes this server's upcoming movie nights and
+  deletes **both** the scheduled event and the announcement message.
+- **`/movie-config set | show | clear`** — per-guild configuration.
+- **AI content** via the [GitHub Copilot CLI](https://github.com/github/copilot-cli):
+  the bot shells out to `copilot -p ... --silent` to write the announcement and
+  a synopsis + fun facts for the event. Falls back to a plain template if
+  Copilot isn't available (toggle with `use_copilot` in `config.json`).
+
+---
+
+## How it works
+
+```mermaid
+flowchart TD
+    A[Mod runs /movie in mod channel] --> B[Modal: title, year, date, time, runtime]
+    B --> C[fetch_backdrop.py → TMDB 16:9 image]
+    B --> D[copilot -p --silent → JSON: announcement + event blurb]
+    C --> E[create_scheduled_event in voice channel]
+    D --> E
+    D --> F[post announcement in announce channel]
+    E --> G[(events.json: event_id, message_id, …)]
+    F --> G
+    G -.-> H[/movie-cancel deletes event + message/]
+```
+
+Per-guild state lives in JSON files next to `bot.py`:
+
+| File | Purpose | Committed? |
+| --- | --- | --- |
+| `token` | bot token (or use `MOVIE_BOT_TOKEN`) | no (gitignored) |
+| `config.json` | global defaults | no |
+| `guilds.json` | per-guild channel/role/tz config | no |
+| `events.json` | scheduled events the bot created (for cancel) | no |
+| `bot.log` | runtime log | no |
+
+---
+
+## Required Discord setup
+
+### Permissions (integer `8589986816` — **not** Administrator)
+
+| Permission | Why |
+| --- | --- |
+| View Channels | see configured channels |
+| Send Messages | post announcements |
+| Embed Links | render link previews |
+| Attach Files | attach the backdrop image |
+| Manage Events | create/delete scheduled events |
+
+### Invite scopes
+
+`bot` + `applications.commands`
+
+### Invite URL
+
+```
+https://discord.com/api/oauth2/authorize?client_id=YOUR_APP_ID&scope=bot+applications.commands&permissions=8589986816
+```
+
+Gateway intents: **guilds only** (no Message Content / Members / Presence).
+
+---
+
+## Install
+
+Requires **Python 3.11+** (uses `zoneinfo`) and, for AI content, the
+**GitHub Copilot CLI** on the host.
+
+```bash
+git clone https://github.com/M1XZG/movie-night-bot.git
+cd movie-night-bot
+
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+
+cp config.example.json config.json        # edit if you like
+echo "YOUR_BOT_TOKEN" > token && chmod 600 token   # or export MOVIE_BOT_TOKEN
+
+.venv/bin/python bot.py
+```
+
+### Run as a systemd user service
+
+```bash
+cp movie-night-bot.service ~/.config/systemd/user/
+# edit paths inside the unit if your clone isn't at ~/movie-night-bot
+systemctl --user daemon-reload
+systemctl --user enable --now movie-night-bot
+journalctl --user -u movie-night-bot -f
+```
+
+> **AI content gotcha:** the bot calls the `copilot` CLI as a subprocess. Under
+> systemd's minimal `PATH`, an old system `node` can be picked up and break the
+> Copilot loader (`SyntaxError: Unexpected token '?'`). The bot mitigates this
+> by prepending the `copilot` binary's own `bin/` dir to the subprocess `PATH`.
+> If you still see template-only posts, set an explicit `Environment=PATH=...`
+> in the unit (see the commented line in `movie-night-bot.service`).
+
+---
+
+## Configure a server (per guild)
+
+A mod with **Manage Events** runs, in the channel that should become the mod
+channel:
+
+```
+/movie-config set mod_channel:#mods announce_channel:#announcements voice_channel:🔊 Movie Night ping_role:@Movie Pings timezone:Europe/London
+```
+
+Then check it:
+
+```
+/movie-config show
+```
+
+Now schedule one (must be run in the configured mod channel):
+
+```
+/movie
+```
+
+…and cancel if needed:
+
+```
+/movie-cancel   # pick from the autocomplete list
+```
+
+### Config options
+
+| Option | Notes |
+| --- | --- |
+| `mod_channel` | only channel where `/movie` and `/movie-cancel` work |
+| `announce_channel` | where announcements are posted |
+| `voice_channel` | the scheduled event's voice channel |
+| `ping_role` | optional role to ping at the top (use `@everyone` for everyone) |
+| `timezone` | IANA tz name, e.g. `America/New_York` (default from `config.json`) |
+
+`config.json` global defaults:
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `default_timezone` | `Europe/London` | fallback tz |
+| `use_copilot` | `true` | enable AI content via the Copilot CLI |
+| `copilot_timeout` | `120` | seconds to wait for Copilot |
+| `default_runtime_minutes` | `120` | event length when runtime omitted |
+
+---
+
+## Security notes
+
+- Slash commands are gated with `default_permissions(manage_events=True)` and
+  `guild_only()`; `/movie` and `/movie-cancel` are additionally restricted to
+  the configured mod channel.
+- The bot requests **no privileged intents** and uses `Intents.none()` +
+  `guilds`. It never reads message content.
+- Secrets (`token`) and per-instance state are gitignored. Use
+  `MOVIE_BOT_TOKEN` to keep the token out of the filesystem entirely.
+
+---
+
+## License
+
+[MIT](LICENSE)

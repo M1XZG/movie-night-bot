@@ -1,0 +1,2 @@
+# Pin a recent discord.py 2.x (tested with 2.7.1).
+discord.py>=2.4,<3

@@ -1,0 +1,18 @@
+[Unit]
+Description=Movie Night Discord bot (slash commands + scheduled events)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Adjust these two paths to where you cloned the repo and created the venv:
+WorkingDirectory=%h/movie-night-bot
+ExecStart=%h/movie-night-bot/.venv/bin/python %h/movie-night-bot/bot.py
+Restart=always
+RestartSec=5
+# The bot shells out to the `copilot` CLI for AI content. systemd's minimal
+# PATH can resolve an old node; point PATH at your node/copilot bin dir:
+# Environment=PATH=%h/.nvm/versions/node/v22.11.0/bin:/usr/local/bin:/usr/bin:/bin
+
+[Install]
+WantedBy=default.target

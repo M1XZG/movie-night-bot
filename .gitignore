@@ -1,0 +1,16 @@
+# Secrets & per-instance state
+token
+config.json
+guilds.json
+events.json
+bot.log
+
+# Scratch
+tmp/
+*.jpg
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
