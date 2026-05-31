@@ -63,7 +63,7 @@ Per-guild state lives in JSON files next to `bot.py`:
 
 ## Required Discord setup
 
-### Permissions (integer `8589986816` — **not** Administrator)
+### Permissions (integer `17600777079808` — **not** Administrator)
 
 | Permission | Why |
 | --- | --- |
@@ -71,7 +71,15 @@ Per-guild state lives in JSON files next to `bot.py`:
 | Send Messages | post announcements |
 | Embed Links | render link previews |
 | Attach Files | attach the backdrop image |
-| Manage Events | create/delete scheduled events |
+| Connect | required to schedule a **voice-channel** event |
+| Create Events | create scheduled events |
+| Manage Events | edit/delete scheduled events |
+
+> **Note:** Discord split event permissions into **Create Events** (to create)
+> and **Manage Events** (to edit/delete any). Creating a scheduled event needs
+> **Create Events** — an invite with only Manage Events will fail with a
+> `Forbidden` error. For a *voice* event the bot also needs **View Channel** and
+> **Connect** on the target voice channel.
 
 ### Invite scopes
 
@@ -80,7 +88,7 @@ Per-guild state lives in JSON files next to `bot.py`:
 ### Invite URL
 
 ```
-https://discord.com/api/oauth2/authorize?client_id=YOUR_APP_ID&scope=bot+applications.commands&permissions=8589986816
+https://discord.com/api/oauth2/authorize?client_id=YOUR_APP_ID&scope=bot+applications.commands&permissions=17600777079808
 ```
 
 Gateway intents: **guilds only** (no Message Content / Members / Presence).

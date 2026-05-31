@@ -439,7 +439,8 @@ class MovieModal(discord.ui.Modal, title="Schedule a Movie Night"):
         except discord.Forbidden as e:
             await interaction.followup.send(
                 "⚠️ I couldn't create the event. For a **voice** event I need "
-                "**Manage Events** plus **View Channel** and **Connect** on "
+                "the **Create Events** permission, plus **View Channel** and "
+                "**Connect** on "
                 f"{voice.mention if hasattr(voice, 'mention') else 'the voice channel'}. "
                 f"Run `/movie-test` to see what's missing.\n`{e.text or e}`",
                 ephemeral=True)
@@ -632,9 +633,12 @@ async def movie_test(interaction: discord.Interaction):
         return
     lines.append(mark(True, "Configuration is set."))
 
-    # 2. Guild-level: Manage Events
-    lines.append(mark(me.guild_permissions.manage_events,
-                      "**Manage Events** permission (to create scheduled events)."))
+    # 2. Guild-level: Create Events (to create) + Manage Events (to delete any)
+    gp = me.guild_permissions
+    lines.append(mark(gp.create_events,
+                      "**Create Events** permission (required to create scheduled events)."))
+    lines.append(mark(gp.manage_events,
+                      "**Manage Events** permission (to edit/delete events)."))
 
     # 3. Announcements channel — view + post
     announce = guild.get_channel(conf["announce_channel_id"])
