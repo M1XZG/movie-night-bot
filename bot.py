@@ -436,10 +436,13 @@ class MovieModal(discord.ui.Modal, title="Schedule a Movie Night"):
             if img_bytes:
                 ev_kwargs["image"] = img_bytes
             event = await guild.create_scheduled_event(**ev_kwargs)
-        except discord.Forbidden:
+        except discord.Forbidden as e:
             await interaction.followup.send(
-                "⚠️ I lack **Manage Events** permission (or can't see the "
-                "voice channel). Ask an admin to grant it.", ephemeral=True)
+                "⚠️ I couldn't create the event. For a **voice** event I need "
+                "**Manage Events** plus **View Channel** and **Connect** on "
+                f"{voice.mention if hasattr(voice, 'mention') else 'the voice channel'}. "
+                f"Run `/movie-test` to see what's missing.\n`{e.text or e}`",
+                ephemeral=True)
             return
         except discord.HTTPException as e:
             await interaction.followup.send(
@@ -649,15 +652,19 @@ async def movie_test(interaction: discord.Interaction):
                           f"Announcements {announce.mention}: "
                           + ("all good." if not bad else "missing " + ", ".join(bad) + ".")))
 
-    # 4. Voice channel — view (needed for the scheduled event)
+    # 4. Voice channel — view + connect (both needed to create a voice event)
     voice = guild.get_channel(conf["voice_channel_id"])
     if voice is None:
         lines.append(mark(False, "Movie voice channel not found (re-run `/movie-config set`)."))
     else:
         p = voice.permissions_for(me)
-        lines.append(mark(p.view_channel,
+        vbad = [n for n, v in (("View Channel", p.view_channel),
+                               ("Connect", p.connect)) if not v]
+        lines.append(mark(not vbad,
                           f"Movie voice channel **{voice.name}**: "
-                          + ("visible." if p.view_channel else "I can't see it (need View Channel).")))
+                          + ("good." if not vbad
+                             else "missing " + ", ".join(vbad)
+                             + " (Discord needs both to schedule a voice event).")))
 
     # 5. Mod channel — view (where /movie is used)
     mod = guild.get_channel(conf["mod_channel_id"])
