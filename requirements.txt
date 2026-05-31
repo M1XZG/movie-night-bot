@@ -1,2 +1,6 @@
 # Pin a recent discord.py 2.x (tested with 2.7.1).
 discord.py>=2.4,<3
+
+# Pillow converts the movie backdrop to a PNG for VRChat event images.
+# Optional: if absent, the VRChat event simply falls back to the group banner.
+Pillow>=10

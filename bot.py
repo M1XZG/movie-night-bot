@@ -214,6 +214,38 @@ async def fetch_backdrop(title: str, year: str | None) -> Path | None:
     return None
 
 
+def _to_vrchat_png(img_bytes: bytes) -> bytes | None:
+    """Convert backdrop bytes to a VRChat-friendly PNG (<=1920px, RGB).
+
+    Best-effort: returns None if Pillow is unavailable or conversion fails.
+    """
+    try:
+        import io
+        from PIL import Image
+    except ImportError:
+        log("Pillow not installed — skipping VRChat event image.")
+        return None
+    try:
+        im = Image.open(io.BytesIO(img_bytes))
+        if im.mode not in ("RGB", "RGBA"):
+            im = im.convert("RGB")
+        max_w = 1920
+        if im.width > max_w:
+            ratio = max_w / im.width
+            im = im.resize((max_w, int(im.height * ratio)), Image.LANCZOS)
+        out = io.BytesIO()
+        im.save(out, format="PNG", optimize=True)
+        data = out.getvalue()
+        if len(data) > 9_500_000:  # stay well under VRChat's limit
+            out = io.BytesIO()
+            im.convert("RGB").save(out, format="PNG")
+            data = out.getvalue()
+        return data
+    except Exception as e:  # noqa: BLE001 - best-effort image path
+        log(f"VRChat image conversion failed: {e}")
+        return None
+
+
 def find_copilot() -> str | None:
     import shutil
     found = shutil.which("copilot")
@@ -495,30 +527,66 @@ class MovieModal(discord.ui.Modal, title="Schedule a Movie Night"):
         vrc_note = ""
         vconf_g = vconf(guild.id)
         if vconf_g.get("group_id") and vconf_g.get("auth_cookie"):
+            cookies = vrc_cookies(vconf_g)
             starts = start_dt.astimezone(dt.timezone.utc).strftime(
                 "%Y-%m-%dT%H:%M:%SZ")
             ends = end_dt.astimezone(dt.timezone.utc).strftime(
                 "%Y-%m-%dT%H:%M:%SZ")
+
+            # Upload the movie backdrop to the linked account (best-effort) so
+            # the event carries it instead of the group's banner.
+            vrc_image_id = None
+            if img_bytes:
+                png = _to_vrchat_png(img_bytes)
+                if png:
+                    try:
+                        vrc_image_id = await vrchat.upload_image(
+                            cookies, png, tag="gallery",
+                            filename=f"movie-night-{event.id}.png")
+                        log(f"VRChat image uploaded for guild {guild.id}: "
+                            f"{vrc_image_id}")
+                    except vrchat.VRChatAuthError:
+                        log(f"VRChat image upload: session expired (guild {guild.id})")
+                    except vrchat.VRChatError as e:
+                        log(f"VRChat image upload failed (guild {guild.id}): "
+                            f"{e.message}")
+
             payload = vrchat.build_event_payload(
                 f"Movie Night: {title}", event_desc, starts, ends,
                 category=vconf_g.get("category", "film_media"),
                 access_type=vconf_g.get("access_type", "group"),
-                send_notification=vconf_g.get("send_notification", True))
+                send_notification=vconf_g.get("send_notification", True),
+                image_id=vrc_image_id)
             try:
                 ev = await vrchat.create_event(
-                    vrc_cookies(vconf_g), vconf_g["group_id"], payload)
+                    cookies, vconf_g["group_id"], payload)
                 cal_id = ev.get("id")
                 record["vrc_group_id"] = vconf_g["group_id"]
                 record["vrc_event_id"] = cal_id
+                if vrc_image_id:
+                    record["vrc_file_id"] = vrc_image_id
                 vrc_note = "\n:globe_with_meridians: Also posted to the VRChat group calendar."
+                if vrc_image_id:
+                    vrc_note += " (with the movie image)"
                 log(f"VRChat event created for guild {guild.id}: {cal_id}")
             except vrchat.VRChatAuthError:
                 vrc_note = ("\n:warning: VRChat session expired — run "
                             "`/movie-vrchat link` to re-link. (Discord event still created.)")
                 log(f"VRChat auth expired for guild {guild.id}")
+                # Don't leave the just-uploaded image orphaned.
+                if vrc_image_id:
+                    try:
+                        await vrchat.delete_file(cookies, vrc_image_id)
+                    except vrchat.VRChatError:
+                        pass
             except vrchat.VRChatError as e:
                 vrc_note = f"\n:warning: VRChat calendar event failed: {e.message}"
                 log(f"VRChat event failed for guild {guild.id}: {e.message}")
+                if vrc_image_id:
+                    try:
+                        await vrchat.delete_file(cookies, vrc_image_id)
+                    except vrchat.VRChatError:
+                        pass
 
         add_event_record(guild.id, record)
 
@@ -808,15 +876,26 @@ async def movie_cancel(interaction: discord.Interaction, movie: str):
     if rec.get("vrc_event_id") and rec.get("vrc_group_id"):
         vconf_g = vconf(interaction.guild_id)
         if vconf_g.get("auth_cookie"):
+            cookies = vrc_cookies(vconf_g)
             try:
                 ok = await vrchat.delete_event(
-                    vrc_cookies(vconf_g), rec["vrc_group_id"], rec["vrc_event_id"])
+                    cookies, rec["vrc_group_id"], rec["vrc_event_id"])
                 notes.append("VRChat event deleted" if ok
                              else "VRChat event already gone")
             except vrchat.VRChatAuthError:
                 notes.append("⚠️ VRChat session expired (event not deleted)")
             except vrchat.VRChatError as e:
                 notes.append(f"⚠️ VRChat delete failed: {e.message}")
+            # Also remove the uploaded image from the linked account.
+            if rec.get("vrc_file_id"):
+                try:
+                    ok = await vrchat.delete_file(cookies, rec["vrc_file_id"])
+                    notes.append("VRChat image deleted" if ok
+                                 else "VRChat image already gone")
+                except vrchat.VRChatAuthError:
+                    notes.append("⚠️ VRChat session expired (image not deleted)")
+                except vrchat.VRChatError as e:
+                    notes.append(f"⚠️ VRChat image delete failed: {e.message}")
 
     remove_event_record(interaction.guild_id, event_id)
     log(f"/movie-cancel by {interaction.user} in guild {guild.id}: "

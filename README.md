@@ -242,10 +242,21 @@ Once linked, every `/movie` also creates a VRChat group calendar event
 (`POST /calendar/{groupId}/event`) using the movie's title, AI synopsis, and
 start/end times; `/movie-cancel` deletes it (`DELETE /calendar/{groupId}/{calendarId}`).
 
+**Event image.** The movie backdrop is converted to a PNG and uploaded to the
+**linked account** (`POST /file/image`, tag `gallery`), and the returned
+`file_…` id is set as the event's `imageId` — so the VRChat event shows the
+movie image instead of the group's banner. When the event is cancelled, the
+uploaded image is also deleted from the linked account
+(`DELETE /file/{fileId}`). Image handling is best-effort: if Pillow is missing,
+the upload fails, or no backdrop is found, the event simply falls back to the
+group banner. (Requires `Pillow` — see `requirements.txt`.)
+
 ### Requirements & caveats
 
 - The linked VRChat account must be a **member of the group with permission to
   manage calendar events**.
+- Uploaded event images are owned by the **linked user account** (they appear in
+  that account's gallery/files) and are removed on `/movie-cancel`.
 - The VRChat API is **unofficial**. The bot sends a descriptive `User-Agent`
   and makes only occasional calls; respect VRChat's rate limits and Terms.
 - Session cookies expire eventually — when they do, `/movie` and
