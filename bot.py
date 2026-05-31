@@ -452,44 +452,44 @@ class MovieModal(discord.ui.Modal, title="Schedule a Movie Night"):
 
         event_url = f"https://discord.com/events/{guild.id}/{event.id}"
 
-        body = f"{body}\n\n:calendar_spiral: **Event:** {event_url}"
-
-        # Optional role ping at the top of the announcement.
-        allowed = discord.AllowedMentions.none()
-        ping_role = None
-        if conf.get("ping_role_id"):
-            ping_role = guild.get_role(conf["ping_role_id"])
-        if ping_role:
-            if ping_role.is_default():
-                body = f"@everyone\n{body}"
-                allowed = discord.AllowedMentions(everyone=True)
-            else:
-                body = f"{ping_role.mention}\n{body}"
-                allowed = discord.AllowedMentions(roles=[ping_role])
-        if len(body) > 2000:
-            body = body[:1990]
-
-        # Post the announcement
-        try:
-            kwargs = {"allowed_mentions": allowed}
-            if img_bytes:
-                kwargs["file"] = discord.File(
-                    str(img_path), filename="backdrop.jpg")
-            msg = await announce.send(content=body, **kwargs)
-        except discord.Forbidden:
-            await interaction.followup.send(
-                f"✅ Event created ({event_url}) but I can't post in "
-                f"{announce.mention} (missing Send Messages/Embed/Attach).",
-                ephemeral=True)
-            return
-
         record = {
             "event_id": event.id,
-            "message_id": msg.id,
-            "channel_id": announce.id,
+            "message_id": None,
+            "channel_id": None,
             "title": title,
             "unix": unix,
         }
+
+        # Post the announcement, unless it's been toggled off for this server.
+        announce_note = ""
+        if conf.get("announce_enabled", True):
+            post = f"{body}\n\n:calendar_spiral: **Event:** {event_url}"
+            allowed = discord.AllowedMentions.none()
+            ping_role = (guild.get_role(conf["ping_role_id"])
+                         if conf.get("ping_role_id") else None)
+            if ping_role:
+                if ping_role.is_default():
+                    post = f"@everyone\n{post}"
+                    allowed = discord.AllowedMentions(everyone=True)
+                else:
+                    post = f"{ping_role.mention}\n{post}"
+                    allowed = discord.AllowedMentions(roles=[ping_role])
+            if len(post) > 2000:
+                post = post[:1990]
+            try:
+                kwargs = {"allowed_mentions": allowed}
+                if img_bytes:
+                    kwargs["file"] = discord.File(
+                        str(img_path), filename="backdrop.jpg")
+                msg = await announce.send(content=post, **kwargs)
+                record["message_id"] = msg.id
+                record["channel_id"] = announce.id
+                announce_note = f" and announced it in {announce.mention}"
+            except discord.Forbidden:
+                announce_note = (f", but I couldn't post in {announce.mention} "
+                                 "(missing Send Messages/Embed/Attach)")
+        else:
+            announce_note = " (announcement skipped — disabled for this server)"
 
         # Optional: also create a VRChat group calendar event (best-effort).
         vrc_note = ""
@@ -523,8 +523,8 @@ class MovieModal(discord.ui.Modal, title="Schedule a Movie Night"):
         add_event_record(guild.id, record)
 
         await interaction.followup.send(
-            f"✅ Scheduled **{title}** for <t:{unix}:F>, created the event, and "
-            f"announced it in {announce.mention}.\n{event_url}{vrc_note}",
+            f"✅ Scheduled **{title}** for <t:{unix}:F>, created the event"
+            f"{announce_note}.\n{event_url}{vrc_note}",
             ephemeral=True)
         log(f"/movie by {interaction.user} in guild {guild.id}: "
             f"'{title}' @ {start_dt.isoformat()} event={event.id}")
@@ -577,7 +577,8 @@ async def movie_help(interaction: discord.Interaction):
     embed.add_field(
         name="Configuration  ·  /movie-config",
         value=("**set** — set the mod channel, announcements channel, movie "
-               "voice channel, optional ping role and timezone (any subset).\n"
+               "voice channel, optional ping role, timezone, and the "
+               "`announcements` toggle (off = create the event only, no post).\n"
                "**show** — show this server's current configuration.\n"
                "**clear** — wipe the configuration to start fresh."),
         inline=False)
@@ -640,8 +641,12 @@ async def movie_test(interaction: discord.Interaction):
     lines.append(mark(gp.manage_events,
                       "**Manage Events** permission (to edit/delete events)."))
 
-    # 3. Announcements channel — view + post
+    # 3. Announcements channel — view + post (skipped if announcements are off)
+    announce_on = conf.get("announce_enabled", True)
     announce = guild.get_channel(conf["announce_channel_id"])
+    if not announce_on:
+        lines.append("ℹ️ Announcements are **off** — `/movie` will create the "
+                     "event (and VRChat event) but won't post a message.")
     if announce is None:
         lines.append(mark(False, "Announcements channel not found (re-run `/movie-config set`)."))
     else:
@@ -652,9 +657,16 @@ async def movie_test(interaction: discord.Interaction):
         sub.append(("Embed Links", p.embed_links))
         sub.append(("Attach Files", p.attach_files))
         bad = [n for n, v in sub if not v]
-        lines.append(mark(not bad,
-                          f"Announcements {announce.mention}: "
-                          + ("all good." if not bad else "missing " + ", ".join(bad) + ".")))
+        prefix = "Announcements" if announce_on else "Announce channel (currently off)"
+        if announce_on:
+            lines.append(mark(not bad,
+                              f"{prefix} {announce.mention}: "
+                              + ("all good." if not bad else "missing " + ", ".join(bad) + ".")))
+        else:
+            # Don't fail the test for a channel we're not posting to.
+            lines.append(f"ℹ️ {prefix} {announce.mention}: "
+                         + ("ready when re-enabled." if not bad
+                            else "missing " + ", ".join(bad) + " (fix before re-enabling)."))
 
     # 4. Voice channel — view + connect (both needed to create a voice event)
     voice = guild.get_channel(conf["voice_channel_id"])
@@ -818,13 +830,14 @@ config_group = app_commands.Group(
     guild_only=True, default_permissions=discord.Permissions(manage_events=True))
 
 
-@config_group.command(name="set", description="Set this server's channels and timezone.")
+@config_group.command(name="set", description="Set this server's channels, timezone and options.")
 @app_commands.describe(
     mod_channel="Channel where mods may run /movie",
     announce_channel="Channel where announcements are posted",
     voice_channel="Voice channel the movie event points to",
     ping_role="Role to @mention with each announcement (optional)",
-    timezone="IANA timezone, e.g. Europe/London (default if unset)")
+    timezone="IANA timezone, e.g. Europe/London (default if unset)",
+    announcements="Post an announcement in the announce channel? (off = event-only)")
 async def config_set(
     interaction: discord.Interaction,
     mod_channel: discord.TextChannel | None = None,
@@ -832,6 +845,7 @@ async def config_set(
     voice_channel: discord.VoiceChannel | None = None,
     ping_role: discord.Role | None = None,
     timezone: str | None = None,
+    announcements: bool | None = None,
 ):
     if timezone:
         try:
@@ -841,7 +855,9 @@ async def config_set(
                 f"⚠️ `{timezone}` isn't a valid IANA timezone (e.g. "
                 "`Europe/London`, `America/New_York`).", ephemeral=True)
             return
-    if not any([mod_channel, announce_channel, voice_channel, ping_role, timezone]):
+    provided = [mod_channel, announce_channel, voice_channel, ping_role,
+                timezone, announcements]
+    if all(v is None for v in provided):
         await interaction.response.send_message(
             "Nothing to set — provide at least one option.", ephemeral=True)
         return
@@ -851,7 +867,8 @@ async def config_set(
         announce_channel_id=announce_channel.id if announce_channel else None,
         voice_channel_id=voice_channel.id if voice_channel else None,
         ping_role_id=ping_role.id if ping_role else None,
-        timezone=timezone)
+        timezone=timezone,
+        announce_enabled=announcements)
     log(f"/movie-config set by {interaction.user} in guild "
         f"{interaction.guild_id}: {conf}")
     await interaction.response.send_message(
@@ -901,6 +918,8 @@ def _format_conf(guild: discord.Guild, conf: dict) -> str:
     return (
         f"• **Mod channel:** {chan(conf.get('mod_channel_id'))}\n"
         f"• **Announcements:** {chan(conf.get('announce_channel_id'))}\n"
+        f"• **Post announcement:** "
+        f"{'on' if conf.get('announce_enabled', True) else 'off (event-only)'}\n"
         f"• **Movie voice channel:** {chan(conf.get('voice_channel_id'))}\n"
         f"• **Ping role:** {role(conf.get('ping_role_id'))}\n"
         f"• **Timezone:** `{conf.get('timezone', CFG['default_timezone'])}`")

@@ -147,6 +147,16 @@ Then check it:
 /movie-config show
 ```
 
+To create the Discord event (and VRChat event) **without** posting an
+announcement — e.g. an events-only server — turn announcements off:
+
+```
+/movie-config set announcements:False
+```
+
+Set `announcements:True` to turn posting back on. The announcements channel is
+still required either way, so it's ready when you re-enable it.
+
 Now schedule one (must be run in the configured mod channel):
 
 ```
