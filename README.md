@@ -21,6 +21,8 @@ own channels, ping role and timezone.
     e.g. *Movie Night*, *Anime Matinée*, *Series Night*, *Morning Binge*.
     (Daypart buckets: Morning 05:00–11:59, Afternoon 12:00–17:59, Night
     18:00–04:59. Default type is Movie.)
+  - A **`vrchat`** option (default *yes* when a VRChat group is linked) — set
+    `vrchat:False` for a Discord-only watch party that skips the VRChat event.
 - **`/movie-test`** — dry-run that verifies config and all required permissions
   (Manage Events, channel visibility, send/embed/attach, ping role) **without**
   posting anything. Run this before the first real `/movie`.
@@ -168,6 +170,7 @@ Now schedule one (must be run in the configured mod channel):
 /movie                       # defaults to a Movie
 /movie type:🌸 Anime         # wording becomes Anime Night / Anime Matinée / …
 /movie type:📺 TV Series     # Series Night / Series Matinée / Morning Binge
+/movie vrchat:False          # Discord-only — skip the VRChat event this time
 ```
 
 …and cancel if needed:
@@ -248,6 +251,8 @@ flowchart TD
 Once linked, every `/movie` also creates a VRChat group calendar event
 (`POST /calendar/{groupId}/event`) using the movie's title, AI synopsis, and
 start/end times; `/movie-cancel` deletes it (`DELETE /calendar/{groupId}/{calendarId}`).
+Pass `vrchat:False` on `/movie` to skip the VRChat event for a single
+Discord-only watch party.
 
 **Event image.** The movie backdrop is converted to a PNG and uploaded to the
 **linked account** (`POST /file/image`, tag `gallery`), and the returned

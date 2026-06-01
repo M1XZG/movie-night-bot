@@ -425,10 +425,12 @@ tree = app_commands.CommandTree(client)
 
 
 class MovieModal(discord.ui.Modal, title="Schedule a Watch Party"):
-    def __init__(self, conf: dict, show_type: str = "movie"):
+    def __init__(self, conf: dict, show_type: str = "movie",
+                 make_vrchat: bool = True):
         super().__init__(timeout=600)
         self.conf = conf
         self.show_type = show_type if show_type in LABEL_MATRIX else "movie"
+        self.make_vrchat = make_vrchat
 
     movie = discord.ui.TextInput(
         label="Title", placeholder="e.g. The Matrix", max_length=100)
@@ -587,7 +589,10 @@ class MovieModal(discord.ui.Modal, title="Schedule a Watch Party"):
         # Optional: also create a VRChat group calendar event (best-effort).
         vrc_note = ""
         vconf_g = vconf(guild.id)
-        if vconf_g.get("group_id") and vconf_g.get("auth_cookie"):
+        vrc_linked = bool(vconf_g.get("group_id") and vconf_g.get("auth_cookie"))
+        if vrc_linked and not self.make_vrchat:
+            vrc_note = "\n:globe_with_meridians: VRChat event skipped (Discord-only watch party)."
+        elif vrc_linked:
             cookies = vrc_cookies(vconf_g)
             starts = start_dt.astimezone(dt.timezone.utc).strftime(
                 "%Y-%m-%dT%H:%M:%SZ")
@@ -664,7 +669,8 @@ class MovieModal(discord.ui.Modal, title="Schedule a Watch Party"):
 @app_commands.guild_only()
 @app_commands.default_permissions(manage_events=True)
 @app_commands.describe(
-    type="What you're showing — adapts the wording (default: Movie).")
+    type="What you're showing — adapts the wording (default: Movie).",
+    vrchat="Also create a VRChat group event? (default: yes when linked).")
 @app_commands.choices(type=[
     app_commands.Choice(name="🎬 Movie", value="movie"),
     app_commands.Choice(name="📺 TV Series", value="tv"),
@@ -672,7 +678,8 @@ class MovieModal(discord.ui.Modal, title="Schedule a Watch Party"):
     app_commands.Choice(name="🍿 Other", value="other"),
 ])
 async def movie(interaction: discord.Interaction,
-                type: app_commands.Choice[str] | None = None):
+                type: app_commands.Choice[str] | None = None,
+                vrchat: bool | None = None):
     conf = gconf(interaction.guild_id)
     needed = ("mod_channel_id", "announce_channel_id", "voice_channel_id")
     missing = [k for k in needed if k not in conf]
@@ -689,7 +696,9 @@ async def movie(interaction: discord.Interaction,
             f"⚠️ `/movie` can only be used in {where}.", ephemeral=True)
         return
     show_type = type.value if type else "movie"
-    await interaction.response.send_modal(MovieModal(conf, show_type))
+    make_vrchat = True if vrchat is None else vrchat
+    await interaction.response.send_modal(
+        MovieModal(conf, show_type, make_vrchat))
 
 
 @tree.command(name="movie-help",
@@ -707,8 +716,10 @@ async def movie_help(interaction: discord.Interaction):
         value=("**/movie** — open a form (title, year, date, time, runtime) to "
                "create a scheduled event + announcement. Pick a **type** "
                "(Movie / TV Series / Anime / Other) and the wording adapts to "
-               "the show and time of day (e.g. *Anime Matinée*). *Only works "
-               "in the configured mod channel.*\n"
+               "the show and time of day (e.g. *Anime Matinée*). Set "
+               "**vrchat:False** for a Discord-only watch party (skips the "
+               "VRChat event even when linked). *Only works in the configured "
+               "mod channel.*\n"
                "**/movie-test** — dry-run that checks config & permissions "
                "without posting anything. Run this first.\n"
                "**/movie-cancel** — pick an upcoming movie night to delete its "
