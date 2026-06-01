@@ -246,6 +246,55 @@ def _to_vrchat_png(img_bytes: bytes) -> bytes | None:
         return None
 
 
+# --------------------------------------------------------------------------- #
+# Show-type + daypart aware wording
+# --------------------------------------------------------------------------- #
+# Per-type emoji used on the event name / announcement header.
+SHOW_TYPE_EMOJI = {
+    "movie": "🎬",
+    "tv": "📺",
+    "anime": "🌸",
+    "other": "🍿",
+}
+# Event/announcement label by (type, daypart). "other" is daypart-agnostic.
+LABEL_MATRIX = {
+    "movie": {"morning": "Movie Morning", "afternoon": "Movie Matinée",
+              "night": "Movie Night"},
+    "tv":    {"morning": "Morning Binge", "afternoon": "Series Matinée",
+              "night": "Series Night"},
+    "anime": {"morning": "Anime Morning", "afternoon": "Anime Matinée",
+              "night": "Anime Night"},
+    "other": {"morning": "Watch Party", "afternoon": "Watch Party",
+              "night": "Watch Party"},
+}
+# Noun used when asking the AI to research the title.
+SHOW_TYPE_NOUN = {
+    "movie": "film",
+    "tv": "TV series",
+    "anime": "anime series",
+    "other": "show",
+}
+
+
+def daypart(when: dt.datetime) -> str:
+    """Bucket a datetime into morning / afternoon / night.
+
+    Morning 05:00–11:59, Afternoon 12:00–17:59, Night 18:00–04:59.
+    """
+    h = when.hour
+    if 5 <= h < 12:
+        return "morning"
+    if 12 <= h < 18:
+        return "afternoon"
+    return "night"
+
+
+def label_for(show_type: str, when: dt.datetime) -> tuple[str, str]:
+    """Return (label, emoji) for a show type at a given start time."""
+    st = show_type if show_type in LABEL_MATRIX else "movie"
+    return LABEL_MATRIX[st][daypart(when)], SHOW_TYPE_EMOJI[st]
+
+
 def find_copilot() -> str | None:
     import shutil
     found = shutil.which("copilot")
@@ -256,11 +305,13 @@ def find_copilot() -> str | None:
     return None
 
 
-async def enrich_with_copilot(title, year, unix, runtime_min) -> dict | None:
+async def enrich_with_copilot(title, year, unix, runtime_min,
+                              show_type="movie", label="Movie Night") -> dict | None:
     """Ask Copilot CLI for the announcement body AND a short event blurb.
 
     Returns {"announcement": str, "event_description": str} or None on failure.
-    Text only, no tools.
+    Text only, no tools. ``show_type`` adapts the research/wording; ``label`` is
+    the type/daypart-aware header (e.g. "Anime Matinée").
     """
     if not CFG.get("use_copilot", True):
         return None
@@ -268,23 +319,26 @@ async def enrich_with_copilot(title, year, unix, runtime_min) -> dict | None:
     if not bin:
         return None
     yr = f" ({year})" if year else ""
+    noun = SHOW_TYPE_NOUN.get(show_type, "film")
+    runtime_label = ("episode/season runtime" if show_type in ("tv", "anime")
+                     else "Runtime")
     prompt = (
-        "You are writing content for a Discord movie-night bot. Research the "
-        f"film \"{title}\"{yr} from your own knowledge and produce fun, "
+        "You are writing content for a Discord watch-party bot. Research the "
+        f"{noun} \"{title}\"{yr} from your own knowledge and produce fun, "
         "accurate content. Keep facts accurate; if unsure about a detail, omit "
         "it. Do not invent a runtime if unknown.\n\n"
         "Output ONLY a JSON object (no markdown fences, no commentary) with "
         "exactly these two string keys:\n\n"
         "1. \"announcement\": a whimsical Discord announcement (max 1800 chars) "
         "using :shortcode: emoji (NOT unicode) and this EXACT structure:\n"
-        ":clapper: **Movie Night: <TITLE>** <themed-emoji>\n\n"
+        f":clapper: **{label}: <TITLE>** <themed-emoji>\n\n"
         "<one whimsical intro line>\n\n"
         f"Join us at <t:{unix}:F> for **{title}**, <one-line premise>.\n\n"
-        ":clapper: **Film:** <title and year>\n"
+        f":clapper: **{'Series' if show_type in ('tv', 'anime') else 'Film'}:** <title and year>\n"
         f":alarm_clock: **When:** <t:{unix}:F>\n"
-        ":performing_arts: **Starring:** <top 3-5 cast>\n"
-        ":clapper: **Directed by:** <director>\n"
-        ":hourglass_flowing_sand: **Runtime:** about <Xh Ym>\n\n"
+        ":performing_arts: **Starring:** <top 3-5 cast or voice cast>\n"
+        f":clapper: **{'Created by' if show_type in ('tv', 'anime') else 'Directed by'}:** <creator or director>\n"
+        f":hourglass_flowing_sand: **{runtime_label}:** about <Xh Ym>\n\n"
         "**What's it about?**\n<short paragraph>\n\n"
         "**Fun bits:**\n• <bullet>\n• <bullet>\n• <bullet>\n\n"
         "<whimsical closing line>\n\n"
@@ -343,17 +397,18 @@ def _parse_enrichment(text: str) -> dict | None:
     return {"announcement": ann[:1990], "event_description": desc[:900]}
 
 
-def template_announcement(title, year, unix, runtime_min) -> str:
+def template_announcement(title, year, unix, runtime_min,
+                          label="Movie Night", emoji="🍿") -> str:
     yr = f" ({year})" if year else ""
     rt = ""
     if runtime_min:
         h, m = divmod(int(runtime_min), 60)
         rt = f"\n:hourglass_flowing_sand: **Runtime:** about {h}h {m:02d}m"
     return (
-        f":clapper: **Movie Night: {title}** :popcorn:\n\n"
-        "Grab your snacks and a comfy seat — it's movie night!\n\n"
+        f":clapper: **{label}: {title}** :popcorn:\n\n"
+        f"Grab your snacks and a comfy seat — it's {label.lower()}!\n\n"
         f"Join us at <t:{unix}:F> for **{title}**{yr}.\n\n"
-        f":clapper: **Film:** {title}{yr}\n"
+        f":clapper: **Showing:** {title}{yr}\n"
         f":alarm_clock: **When:** <t:{unix}:F>"
         f"{rt}\n\n"
         "React if you're in. See you there! :tada:"
@@ -369,13 +424,14 @@ client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
 
 
-class MovieModal(discord.ui.Modal, title="Schedule a Movie Night"):
-    def __init__(self, conf: dict):
+class MovieModal(discord.ui.Modal, title="Schedule a Watch Party"):
+    def __init__(self, conf: dict, show_type: str = "movie"):
         super().__init__(timeout=600)
         self.conf = conf
+        self.show_type = show_type if show_type in LABEL_MATRIX else "movie"
 
     movie = discord.ui.TextInput(
-        label="Movie title", placeholder="e.g. The Matrix", max_length=100)
+        label="Title", placeholder="e.g. The Matrix", max_length=100)
     year = discord.ui.TextInput(
         label="Year (optional, helps for remakes)", required=False,
         placeholder="e.g. 1999", max_length=4)
@@ -437,27 +493,32 @@ class MovieModal(discord.ui.Modal, title="Schedule a Movie Night"):
                 "`/movie-config set`.", ephemeral=True)
             return
 
+        # Type + daypart aware wording (e.g. "Anime Matinée", "Movie Night").
+        label, emoji = label_for(self.show_type, start_dt)
+
         # Backdrop image (best-effort)
         img_path = await fetch_backdrop(title, yr)
         img_bytes = img_path.read_bytes() if img_path else None
 
         # Generate rich content once (announcement body + event blurb).
-        enriched = await enrich_with_copilot(title, yr, unix, runtime_min)
+        enriched = await enrich_with_copilot(
+            title, yr, unix, runtime_min, self.show_type, label)
         if enriched:
             body = enriched["announcement"]
             event_desc = enriched.get("event_description") or ""
         else:
-            body = template_announcement(title, yr, unix, runtime_min)
+            body = template_announcement(
+                title, yr, unix, runtime_min, label, emoji)
             event_desc = ""
         if not event_desc:
-            event_desc = (f"Movie night — {title}{f' ({yr})' if yr else ''}. "
+            event_desc = (f"{label} — {title}{f' ({yr})' if yr else ''}. "
                           "Grab snacks and join us!")
         event_desc = event_desc[:1000]
 
         # Create the scheduled event
         try:
             ev_kwargs = dict(
-                name=f"🎬 Movie Night: {title}",
+                name=f"{emoji} {label}: {title}",
                 description=event_desc,
                 start_time=start_dt,
                 end_time=end_dt,
@@ -552,7 +613,7 @@ class MovieModal(discord.ui.Modal, title="Schedule a Movie Night"):
                             f"{e.message}")
 
             payload = vrchat.build_event_payload(
-                f"Movie Night: {title}", event_desc, starts, ends,
+                f"{label}: {title}", event_desc, starts, ends,
                 category=vconf_g.get("category", "film_media"),
                 access_type=vconf_g.get("access_type", "group"),
                 send_notification=vconf_g.get("send_notification", True),
@@ -599,10 +660,19 @@ class MovieModal(discord.ui.Modal, title="Schedule a Movie Night"):
 
 
 @tree.command(name="movie",
-              description="Schedule a movie night (creates an event + announcement).")
+              description="Schedule a watch party (creates an event + announcement).")
 @app_commands.guild_only()
 @app_commands.default_permissions(manage_events=True)
-async def movie(interaction: discord.Interaction):
+@app_commands.describe(
+    type="What you're showing — adapts the wording (default: Movie).")
+@app_commands.choices(type=[
+    app_commands.Choice(name="🎬 Movie", value="movie"),
+    app_commands.Choice(name="📺 TV Series", value="tv"),
+    app_commands.Choice(name="🌸 Anime", value="anime"),
+    app_commands.Choice(name="🍿 Other", value="other"),
+])
+async def movie(interaction: discord.Interaction,
+                type: app_commands.Choice[str] | None = None):
     conf = gconf(interaction.guild_id)
     needed = ("mod_channel_id", "announce_channel_id", "voice_channel_id")
     missing = [k for k in needed if k not in conf]
@@ -618,7 +688,8 @@ async def movie(interaction: discord.Interaction):
         await interaction.response.send_message(
             f"⚠️ `/movie` can only be used in {where}.", ephemeral=True)
         return
-    await interaction.response.send_modal(MovieModal(conf))
+    show_type = type.value if type else "movie"
+    await interaction.response.send_modal(MovieModal(conf, show_type))
 
 
 @tree.command(name="movie-help",
@@ -634,8 +705,10 @@ async def movie_help(interaction: discord.Interaction):
     embed.add_field(
         name="Scheduling",
         value=("**/movie** — open a form (title, year, date, time, runtime) to "
-               "create a scheduled event + announcement. *Only works in the "
-               "configured mod channel.*\n"
+               "create a scheduled event + announcement. Pick a **type** "
+               "(Movie / TV Series / Anime / Other) and the wording adapts to "
+               "the show and time of day (e.g. *Anime Matinée*). *Only works "
+               "in the configured mod channel.*\n"
                "**/movie-test** — dry-run that checks config & permissions "
                "without posting anything. Run this first.\n"
                "**/movie-cancel** — pick an upcoming movie night to delete its "

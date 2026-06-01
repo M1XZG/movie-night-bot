@@ -16,6 +16,11 @@ own channels, ping role and timezone.
 - **`/movie`** — opens a form (title / year / date / time / runtime), then:
   - creates a Discord scheduled event (with a 16:9 backdrop image when found), and
   - posts a styled announcement, optionally pinging a configurable role.
+  - A **`type`** option (Movie / TV Series / Anime / Other) plus the start time
+    make the event name and announcement adapt to the show and time of day —
+    e.g. *Movie Night*, *Anime Matinée*, *Series Night*, *Morning Binge*.
+    (Daypart buckets: Morning 05:00–11:59, Afternoon 12:00–17:59, Night
+    18:00–04:59. Default type is Movie.)
 - **`/movie-test`** — dry-run that verifies config and all required permissions
   (Manage Events, channel visibility, send/embed/attach, ping role) **without**
   posting anything. Run this before the first real `/movie`.
@@ -160,7 +165,9 @@ still required either way, so it's ready when you re-enable it.
 Now schedule one (must be run in the configured mod channel):
 
 ```
-/movie
+/movie                       # defaults to a Movie
+/movie type:🌸 Anime         # wording becomes Anime Night / Anime Matinée / …
+/movie type:📺 TV Series     # Series Night / Series Matinée / Morning Binge
 ```
 
 …and cancel if needed:
