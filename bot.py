@@ -594,7 +594,12 @@ class MovieModal(discord.ui.Modal, title="Schedule a Watch Party"):
             vrc_note = "\n:globe_with_meridians: VRChat event skipped (Discord-only watch party)."
         elif vrc_linked:
             cookies = vrc_cookies(vconf_g)
-            starts = start_dt.astimezone(dt.timezone.utc).strftime(
+            # Optionally bring the VRChat event's start forward (end unchanged) so
+            # VRChat's own "event starting soon" announcement lands before the
+            # movie actually begins. End time is left at the real finish.
+            early_min = int(vconf_g.get("early_start_minutes", 0) or 0)
+            vrc_start_dt = start_dt - dt.timedelta(minutes=early_min)
+            starts = vrc_start_dt.astimezone(dt.timezone.utc).strftime(
                 "%Y-%m-%dT%H:%M:%SZ")
             ends = end_dt.astimezone(dt.timezone.utc).strftime(
                 "%Y-%m-%dT%H:%M:%SZ")
@@ -1264,10 +1269,13 @@ async def vrc_status(interaction: discord.Interaction):
         valid = "⚠️ expired — run `/movie-vrchat link` to refresh"
     except vrchat.VRChatError as e:
         valid = f"⚠️ check failed: {e.message}"
+    early = int(conf.get("early_start_minutes", 0) or 0)
+    early_label = f"{early} min early" if early else "off (starts at showtime)"
     await interaction.followup.send(
         f"• **VRChat account:** {conf.get('display_name', '—')}\n"
         f"• **Group:** `{conf['group_id']}`\n"
         f"• **Category:** `{conf.get('category', 'film_media')}`\n"
+        f"• **Early start:** {early_label}\n"
         f"• **Session:** {valid}", ephemeral=True)
 
 
@@ -1280,6 +1288,29 @@ async def vrc_unlink(interaction: discord.Interaction):
     await interaction.response.send_message(
         "🧹 VRChat link removed and stored session deleted." if cleared
         else "Nothing to unlink — no VRChat group is linked.", ephemeral=True)
+
+
+@vrc_group.command(
+    name="early-start",
+    description="Start the VRChat event N minutes early (end time unchanged).")
+@app_commands.describe(
+    minutes="Minutes to bring the VRChat event start forward (0 disables, max 60).")
+async def vrc_early_start(interaction: discord.Interaction, minutes: int):
+    if not vconf(interaction.guild_id).get("group_id"):
+        await interaction.response.send_message(
+            "No VRChat group linked. Run `/movie-vrchat link` first.", ephemeral=True)
+        return
+    minutes = max(0, min(60, minutes))
+    set_vconf(interaction.guild_id, {"early_start_minutes": minutes})
+    log(f"/movie-vrchat early-start by {interaction.user} in guild "
+        f"{interaction.guild_id}: {minutes} min")
+    if minutes:
+        msg = (f"⏪ VRChat events will now start **{minutes} min early** so VRChat's "
+               f"announcement goes out before showtime. The end time is unchanged "
+               f"(e.g. a 19:00 movie → VRChat event starts 18:{60 - minutes:02d}).")
+    else:
+        msg = "VRChat early start disabled — events start at the movie's real time."
+    await interaction.response.send_message(msg, ephemeral=True)
 
 
 tree.add_command(vrc_group)

@@ -246,6 +246,7 @@ flowchart TD
 | --- | --- |
 | `/movie-vrchat link` | start the credential + 2FA flow (one-time per server) |
 | `/movie-vrchat status` | show the linked account/group and check if the session is still valid |
+| `/movie-vrchat early-start` | start the VRChat event N minutes early (end time unchanged) |
 | `/movie-vrchat unlink` | delete the stored session and group link |
 
 Once linked, every `/movie` also creates a VRChat group calendar event
@@ -253,6 +254,15 @@ Once linked, every `/movie` also creates a VRChat group calendar event
 start/end times; `/movie-cancel` deletes it (`DELETE /calendar/{groupId}/{calendarId}`).
 Pass `vrchat:False` on `/movie` to skip the VRChat event for a single
 Discord-only watch party.
+
+**Early start (optional).** VRChat only fires its "event starting soon"
+announcement when the event begins, so the notice can arrive after the movie has
+already started. Run `/movie-vrchat early-start minutes:10` to bring the VRChat
+event's **start** forward by that many minutes (0 disables, max 60) — the **end
+time is left unchanged**. Example: a 19:00 movie creates a VRChat event that
+starts at 18:50 and still ends at the movie's real finish, so VRChat's heads-up
+lands ~10 min before showtime. This affects the VRChat event only; the Discord
+event/announcement still use the real start time.
 
 **Event image.** The movie backdrop is converted to a PNG and uploaded to the
 **linked account** (`POST /file/image`, tag `gallery`), and the returned
