@@ -16,6 +16,10 @@ own channels, ping role and timezone.
 - **`/movie`** — opens a form (title / year / date / time / runtime), then:
   - creates a Discord scheduled event (with a 16:9 backdrop image when found), and
   - posts a styled announcement, optionally pinging a configurable role.
+  - The **date and time fields are pre-filled** one week after this server's latest
+    upcoming event (same start time), so back-to-back weekly bookings need no retyping.
+    The suggestion is fully editable, and only appears when at least one upcoming
+    event exists.
   - A **`type`** option (Movie / TV Series / Anime / Other) plus the start time
     make the event name and announcement adapt to the show and time of day —
     e.g. *Movie Night*, *Anime Matinée*, *Series Night*, *Morning Binge*.
