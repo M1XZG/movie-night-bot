@@ -139,6 +139,23 @@ def upcoming_records(guild_id: int) -> list:
     return sorted(kept, key=lambda r: r.get("unix", 0))
 
 
+def next_slot_prefill(guild_id: int, tz: "ZoneInfo",
+                      interval_days: int = 7) -> tuple[str | None, str | None]:
+    """Suggest the next (date, time) one interval after the latest upcoming event.
+
+    Returns (YYYY-MM-DD, HH:MM) strings to pre-fill the schedule form, or
+    (None, None) when there are no upcoming events to extrapolate from. The date
+    is advanced on the calendar (date + N days) so the suggested local start time
+    is preserved across daylight-saving changes.
+    """
+    recs = upcoming_records(guild_id)
+    if not recs:
+        return None, None
+    last = dt.datetime.fromtimestamp(recs[-1].get("unix", 0), tz)
+    next_date = last.date() + dt.timedelta(days=interval_days)
+    return next_date.strftime("%Y-%m-%d"), last.strftime("%H:%M")
+
+
 def save_vrc() -> None:
     try:
         VRC_FILE.write_text(json.dumps(VRC, indent=2) + "\n")
@@ -426,24 +443,33 @@ tree = app_commands.CommandTree(client)
 
 class MovieModal(discord.ui.Modal, title="Schedule a Watch Party"):
     def __init__(self, conf: dict, show_type: str = "movie",
-                 make_vrchat: bool = True):
+                 make_vrchat: bool = True,
+                 prefill_date: str | None = None,
+                 prefill_time: str | None = None):
         super().__init__(timeout=600)
         self.conf = conf
         self.show_type = show_type if show_type in LABEL_MATRIX else "movie"
         self.make_vrchat = make_vrchat
 
-    movie = discord.ui.TextInput(
-        label="Title", placeholder="e.g. The Matrix", max_length=100)
-    year = discord.ui.TextInput(
-        label="Year (optional, helps for remakes)", required=False,
-        placeholder="e.g. 1999", max_length=4)
-    date = discord.ui.TextInput(
-        label="Date (YYYY-MM-DD)", placeholder="2026-07-01", max_length=10)
-    start = discord.ui.TextInput(
-        label="Start time (24h, HH:MM)", placeholder="19:00", max_length=5)
-    runtime = discord.ui.TextInput(
-        label="Runtime in minutes (optional)", required=False,
-        placeholder="e.g. 136", max_length=4)
+        # Fields are built here (not as class attributes) so the date/time can be
+        # pre-filled per invocation with the next suggested slot. Defaults stay
+        # fully editable; they just save typing and avoid mis-clicked dates.
+        self.movie = discord.ui.TextInput(
+            label="Title", placeholder="e.g. The Matrix", max_length=100)
+        self.year = discord.ui.TextInput(
+            label="Year (optional, helps for remakes)", required=False,
+            placeholder="e.g. 1999", max_length=4)
+        self.date = discord.ui.TextInput(
+            label="Date (YYYY-MM-DD)", placeholder="2026-07-01", max_length=10,
+            default=prefill_date)
+        self.start = discord.ui.TextInput(
+            label="Start time (24h, HH:MM)", placeholder="19:00", max_length=5,
+            default=prefill_time)
+        self.runtime = discord.ui.TextInput(
+            label="Runtime in minutes (optional)", required=False,
+            placeholder="e.g. 136", max_length=4)
+        for item in (self.movie, self.year, self.date, self.start, self.runtime):
+            self.add_item(item)
 
     async def on_submit(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True, thinking=True)
@@ -702,8 +728,14 @@ async def movie(interaction: discord.Interaction,
         return
     show_type = type.value if type else "movie"
     make_vrchat = True if vrchat is None else vrchat
+    tzname = conf.get("timezone", CFG["default_timezone"])
+    try:
+        tz = ZoneInfo(tzname)
+    except ZoneInfoNotFoundError:
+        tz = ZoneInfo(CFG["default_timezone"])
+    prefill_date, prefill_time = next_slot_prefill(interaction.guild_id, tz)
     await interaction.response.send_modal(
-        MovieModal(conf, show_type, make_vrchat))
+        MovieModal(conf, show_type, make_vrchat, prefill_date, prefill_time))
 
 
 @tree.command(name="movie-help",
