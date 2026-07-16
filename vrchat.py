@@ -44,6 +44,12 @@ VALID_CATEGORIES = {
     "wellness",
 }
 
+# VRChat client platforms an event can target. Members only receive the
+# in-game "event starting" notification if their client matches one of these,
+# so we default to all of them (matching the website's create-event form).
+VALID_PLATFORMS = {"standalonewindows", "android", "ios"}
+DEFAULT_PLATFORMS = ["standalonewindows", "android", "ios"]
+
 
 class VRChatError(Exception):
     def __init__(self, message, status=None):
@@ -295,10 +301,13 @@ async def delete_file(cookies, file_id):
 
 def build_event_payload(title, description, starts_at_utc, ends_at_utc, *,
                         category="film_media", access_type="group",
-                        send_notification=True, image_id=None):
+                        send_notification=True, image_id=None, platforms=None):
     """Assemble the create-calendar-event body. Times are ISO-8601 UTC 'Z'."""
     if category not in VALID_CATEGORIES:
         category = "film_media"
+    plats = [p for p in (platforms or DEFAULT_PLATFORMS) if p in VALID_PLATFORMS]
+    if not plats:
+        plats = list(DEFAULT_PLATFORMS)
     payload = {
         "title": (title or "Movie Night")[:64],
         "description": (description or "")[:1500] or "Movie night!",
@@ -307,6 +316,7 @@ def build_event_payload(title, description, starts_at_utc, ends_at_utc, *,
         "category": category,
         "accessType": access_type if access_type in ("group", "public") else "group",
         "sendCreationNotification": bool(send_notification),
+        "platforms": plats,
     }
     if image_id:
         payload["imageId"] = image_id
