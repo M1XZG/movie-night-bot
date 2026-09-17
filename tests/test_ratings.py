@@ -83,6 +83,47 @@ class LookupTests(unittest.TestCase):
         self.assertNotIn("year", query)
 
     @patch("ratings.urlopen")
+    def test_anime_episode_label_falls_back_to_exact_parent_series(self, get):
+        series_search = {
+            "search": [{
+                "title": "Chainsmoker Cat", "year": 2026, "type": "show",
+                "ids": {"imdbid": "tt39551330", "mdblist": "448ly"},
+            }],
+            "total": 1,
+        }
+        series = {
+            "title": "Chainsmoker Cat", "year": 2026, "type": "show",
+            "ids": {"imdb": "tt39551330", "mdblist": "448ly"},
+            "ratings": [{"source": "imdb", "value": 6.9}],
+        }
+        get.side_effect = [
+            response({"search": [], "total": 0}),
+            response(series_search),
+            response(series),
+        ]
+
+        result = self.lookup(
+            "Chainsmoker Cat episode 10", "2026", "anime")
+
+        self.assertEqual(result.imdb, "6.9/10")
+        searches = [
+            parse_qs(call.args[0].full_url.split("?", 1)[1])["query"][0]
+            for call in get.call_args_list[:2]
+        ]
+        self.assertEqual(
+            searches, ["Chainsmoker Cat episode 10", "Chainsmoker Cat"])
+        self.assertEqual(
+            urlsplit(get.call_args_list[0].args[0].full_url).path,
+            "/search/any",
+        )
+
+    def test_movie_titles_are_never_rewritten_as_episode_labels(self):
+        self.assertEqual(
+            ratings._search_titles("Episode 10", "movie"),
+            ["Episode 10"],
+        )
+
+    @patch("ratings.urlopen")
     def test_yearless_remakes_are_not_guessed(self, get):
         get.return_value = response({
             "total": 2, "search": [
@@ -151,7 +192,7 @@ class LookupTests(unittest.TestCase):
         result = self.lookup()
         self.assertIsNone(result.rotten_tomatoes)
         self.assertEqual(result.imdb, "8.7/10")
-        self.assertEqual(result.missing_message(), "MDBList did not return Rotten Tomatoes scores.")
+        self.assertEqual(result.missing_message(), "No Rotten Tomatoes score is available.")
 
     @patch("ratings.urlopen")
     def test_missing_scores_and_real_zero_percent_are_distinct(self, get):
@@ -161,7 +202,68 @@ class LookupTests(unittest.TestCase):
         self.assertIsNone(result.imdb)
         self.assertIn("IMDb", result.missing_message())
         replies(get, movie={**MOVIE, "ratings": []})
-        self.assertIn("IMDb and Rotten Tomatoes", self.lookup().missing_message())
+        self.assertIn("IMDb or Rotten Tomatoes", self.lookup().missing_message())
+
+    @patch("ratings.urlopen")
+    def test_omdb_is_preferred_when_it_returns_verified_scores(self, get):
+        get.return_value = response({
+            "Response": "True",
+            "Title": "The Matrix",
+            "Year": "1999",
+            "Type": "movie",
+            "imdbID": "tt0133093",
+            "imdbRating": "8.7",
+            "Ratings": [
+                {"Source": "Internet Movie Database", "Value": "8.7/10"},
+                {"Source": "Rotten Tomatoes", "Value": "83%"},
+            ],
+        })
+
+        result = ratings.fetch_ratings(
+            "The Matrix", "1999", "movie",
+            api_key="mdblist-key", omdb_api_key="omdb-key")
+
+        self.assertEqual(
+            result,
+            ratings.MovieRatings("8.7/10", "83%", "tt0133093"),
+        )
+        self.assertEqual(get.call_count, 1)
+        query = parse_qs(urlsplit(get.call_args.args[0].full_url).query)
+        self.assertEqual(query["t"], ["The Matrix"])
+        self.assertEqual(query["type"], ["movie"])
+
+    @patch("ratings.urlopen")
+    def test_omdb_without_scores_falls_back_to_mdblist(self, get):
+        series_search = {
+            "search": [{
+                "title": "Chainsmoker Cat", "year": 2026, "type": "show",
+                "ids": {"imdbid": "tt39551330", "mdblist": "448ly"},
+            }],
+            "total": 1,
+        }
+        series = {
+            "title": "Chainsmoker Cat", "year": 2026, "type": "show",
+            "ids": {"imdb": "tt39551330", "mdblist": "448ly"},
+            "ratings": [{"source": "imdb", "value": 6.9}],
+        }
+        get.side_effect = [
+            response({"Response": "False", "Error": "Series not found!"}),
+            response({
+                "Response": "True", "Title": "Chainsmoker Cat",
+                "Year": "2026–", "Type": "series", "imdbID": "tt39551330",
+                "imdbRating": "N/A", "Ratings": [],
+            }),
+            response({"search": [], "total": 0}),
+            response(series_search),
+            response(series),
+        ]
+
+        result = ratings.fetch_ratings(
+            "Chainsmoker Cat episode 10", "2026", "anime",
+            api_key="mdblist-key", omdb_api_key="omdb-key")
+
+        self.assertEqual(result.imdb, "6.9/10")
+        self.assertIsNone(result.rotten_tomatoes)
 
     @patch("ratings.urlopen")
     def test_invalid_scores_and_conflicts_are_rejected(self, get):

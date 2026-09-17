@@ -38,6 +38,10 @@ own channels, ping role and timezone.
   the bot shells out to `copilot -p ... --silent` to write the announcement and
   a synopsis + fun facts for the event. Falls back to a plain template if
   Copilot isn't available (toggle with `use_copilot` in `config.json`).
+- **Independent ratings:** OMDb is queried first for exact IMDb and Rotten
+  Tomatoes scores, with MDBList as a fallback when OMDb has no usable ratings.
+  Anime/TV labels ending in `episode 10`, `ep. 10` or `S1E10` can safely fall
+  back to the exact parent-series title; movies are never rewritten.
 - **IMDb and Rotten Tomatoes ratings** from MDBList appear below Runtime in
   Discord announcements and in the Discord event description. Rotten Tomatoes
   means the critics' score, not the audience score. These scores are fetched

@@ -51,6 +51,7 @@ import vrchat
 from ratings import (
     MovieRatings, RatingsError, discord_announcement,
     discord_event_description, fetch_ratings, load_api_key,
+    load_omdb_api_key,
 )
 
 HERE = Path(__file__).resolve().parent
@@ -103,6 +104,7 @@ def save_guilds(data: dict) -> None:
 
 CFG = {**DEFAULTS, **load_json(CONFIG_FILE, {})}
 RATINGS_API_KEY = None
+OMDB_API_KEY = ""
 GUILDS = load_json(GUILDS_FILE, {})
 # Per-guild list of scheduled movie nights the bot created, so /movie-cancel can
 # remove both the event and the announcement message:
@@ -478,7 +480,7 @@ class MovieModal(discord.ui.Modal, title="Schedule a Watch Party"):
             self.add_item(item)
 
     async def on_submit(self, interaction: discord.Interaction):
-        global RATINGS_API_KEY
+        global RATINGS_API_KEY, OMDB_API_KEY
         await interaction.response.defer(ephemeral=True, thinking=True)
         conf = self.conf
         tzname = conf.get("timezone", CFG["default_timezone"])
@@ -556,7 +558,8 @@ class MovieModal(discord.ui.Modal, title="Schedule a Watch Party"):
                 RATINGS_API_KEY = await asyncio.to_thread(load_api_key)
             ratings = await asyncio.to_thread(
                 fetch_ratings, title, yr, self.show_type,
-                api_key=RATINGS_API_KEY)
+                api_key=RATINGS_API_KEY,
+                omdb_api_key=OMDB_API_KEY or None)
             ratings_warning = ratings.missing_message()
         except RatingsError as exc:
             ratings_warning = str(exc)
@@ -1399,7 +1402,7 @@ async def on_guild_join(guild: discord.Guild):
 
 
 def main():
-    global RATINGS_API_KEY
+    global RATINGS_API_KEY, OMDB_API_KEY
     token = os.environ.get("MOVIE_BOT_TOKEN", "").strip()
     if not token and TOKEN_FILE.exists():
         token = TOKEN_FILE.read_text().strip()
@@ -1411,6 +1414,12 @@ def main():
         log("MDBList ratings credential loaded.")
     except RatingsError as exc:
         log(f"WARN: ratings unavailable at startup: {exc}")
+    try:
+        OMDB_API_KEY = load_omdb_api_key()
+        log("OMDb ratings credential loaded.")
+    except RatingsError as exc:
+        OMDB_API_KEY = ""
+        log(f"WARN: OMDb ratings unavailable at startup: {exc}")
     TMP_DIR.mkdir(parents=True, exist_ok=True)
     log("Starting Movie Night bot.")
     client.run(token, log_handler=None)
