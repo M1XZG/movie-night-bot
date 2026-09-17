@@ -225,12 +225,18 @@ class LookupTests(unittest.TestCase):
 
         self.assertEqual(
             result,
-            ratings.MovieRatings("8.7/10", "83%", "tt0133093"),
+            ratings.MovieRatings(
+                "8.7/10", "83%", "tt0133093", None, "OMDb"),
         )
         self.assertEqual(get.call_count, 1)
         query = parse_qs(urlsplit(get.call_args.args[0].full_url).query)
         self.assertEqual(query["t"], ["The Matrix"])
         self.assertEqual(query["type"], ["movie"])
+        self.assertIn(
+            "Ratings via [OMDb]",
+            ratings.discord_announcement(
+                "Body", 120, result, limit=500),
+        )
 
     @patch("ratings.urlopen")
     def test_omdb_without_scores_falls_back_to_mdblist(self, get):

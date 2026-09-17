@@ -135,36 +135,38 @@ echo "YOUR_BOT_TOKEN" > token && chmod 600 token   # or export MOVIE_BOT_TOKEN
 
 ### Ratings setup
 
-Create an API key in [MDBList's preferences](https://mdblist.com/preferences/#api),
-then store it with the Linux password manager:
+Create API keys for [OMDb](https://www.omdbapi.com/apikey.aspx) and
+[MDBList](https://mdblist.com/preferences/#api), then store them with the Linux
+password manager:
 
 ```bash
+pass insert api/omdb
 pass insert api/mdblist
 ```
 
-The bot reads that entry at startup and keeps the key only in process memory.
-It never logs the key or puts it in event records. `pass` and the relevant GPG
-key must be available to the account running the bot. If GPG needs unlocking,
-the lookup reports an error instead of opening an interactive prompt in the
-service. After unlocking, the next scheduling attempt can retry.
+The bot queries OMDb first and falls back to MDBList if OMDb has no usable
+IMDb or Rotten Tomatoes score. It keeps both keys only in process memory and
+never logs them or stores them in event records. `pass` and the relevant GPG key
+must be available to the service account.
 
-For another setup, use `MDBLIST_PASS_ENTRY` to select a different entry,
-`MDBLIST_API_KEY` for an environment-provided key, or `MDBLIST_API_KEY_FILE`
-for a private file outside the checkout. Environment key, explicit key file,
-then `pass` is the lookup order. Restart the bot after rotating a loaded key.
+For another setup, use `OMDB_API_KEY` / `MDBLIST_API_KEY`, the corresponding
+`*_API_KEY_FILE` settings, or `OMDB_PASS_ENTRY` / `MDBLIST_PASS_ENTRY`.
+Environment key, explicit key file, then `pass` is the lookup order. Restart
+the bot after rotating a loaded key.
 
-MDBList search uses a year hint that can include neighbouring years. The bot
-checks the exact title and requested year before using a score and refuses
-ambiguous matches. Supply the year for remakes or common titles.
+Both providers are checked against the exact title, media type and requested
+year. Anime and TV labels ending in forms such as `episode 10`, `ep. 10` or
+`S1E10` can retry the exact parent-series title. Movie titles are never
+rewritten. Supply the year for remakes or common titles.
 
-If MDBList omits a score, that source is shown as **unavailable**. Provider or
-credential failures also produce a private warning to the scheduling mod;
-the movie can still be scheduled. The bot does not substitute TMDB, audience
-or composite scores for either requested source.
+If both providers omit a score, that source is shown as **unavailable**.
+Provider or credential failures produce a private warning to the scheduling
+mod; the movie can still be scheduled. The bot does not substitute TMDB,
+audience or composite scores.
 
-Ratings are a snapshot supplied by MDBList, with attribution in the Discord
-output. They may differ from a later visit to the original sites. Existing
-events and announcements are not backfilled automatically.
+Ratings include attribution to the provider that supplied them. They may
+differ from a later visit to the original sites. Existing events and
+announcements are not backfilled automatically.
 
 ### Tests
 
