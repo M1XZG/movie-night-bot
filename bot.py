@@ -48,6 +48,10 @@ import discord
 from discord import app_commands
 
 import vrchat
+from ratings import (
+    MovieRatings, RatingsError, discord_announcement,
+    discord_event_description, fetch_ratings, load_api_key,
+)
 
 HERE = Path(__file__).resolve().parent
 TOKEN_FILE = HERE / "token"
@@ -98,6 +102,7 @@ def save_guilds(data: dict) -> None:
 
 
 CFG = {**DEFAULTS, **load_json(CONFIG_FILE, {})}
+RATINGS_API_KEY = None
 GUILDS = load_json(GUILDS_FILE, {})
 # Per-guild list of scheduled movie nights the bot created, so /movie-cancel can
 # remove both the event and the announcement message:
@@ -343,7 +348,8 @@ async def enrich_with_copilot(title, year, unix, runtime_min,
         "You are writing content for a Discord watch-party bot. Research the "
         f"{noun} \"{title}\"{yr} from your own knowledge and produce fun, "
         "accurate content. Keep facts accurate; if unsure about a detail, omit "
-        "it. Do not invent a runtime if unknown.\n\n"
+        "it. Do not invent a runtime if unknown. Do not include IMDb, Rotten "
+        "Tomatoes, or other review scores; the bot looks those up separately.\n\n"
         "Output ONLY a JSON object (no markdown fences, no commentary) with "
         "exactly these two string keys:\n\n"
         "1. \"announcement\": a whimsical Discord announcement (max 1800 chars) "
@@ -472,6 +478,7 @@ class MovieModal(discord.ui.Modal, title="Schedule a Watch Party"):
             self.add_item(item)
 
     async def on_submit(self, interaction: discord.Interaction):
+        global RATINGS_API_KEY
         await interaction.response.defer(ephemeral=True, thinking=True)
         conf = self.conf
         tzname = conf.get("timezone", CFG["default_timezone"])
@@ -543,11 +550,28 @@ class MovieModal(discord.ui.Modal, title="Schedule a Watch Party"):
                           "Grab snacks and join us!")
         event_desc = event_desc[:1000]
 
+        ratings = MovieRatings()
+        try:
+            if RATINGS_API_KEY is None:
+                RATINGS_API_KEY = await asyncio.to_thread(load_api_key)
+            ratings = await asyncio.to_thread(
+                fetch_ratings, title, yr, self.show_type,
+                api_key=RATINGS_API_KEY)
+            ratings_warning = ratings.missing_message()
+        except RatingsError as exc:
+            ratings_warning = str(exc)
+        ratings_note = ""
+        if ratings_warning:
+            log(f"WARN: movie ratings unavailable: {ratings_warning}")
+            ratings_note = f"\n:warning: Ratings: {ratings_warning}"
+        discord_desc = discord_event_description(
+            event_desc, runtime_min, ratings, announcement=body)
+
         # Create the scheduled event
         try:
             ev_kwargs = dict(
                 name=f"{emoji} {label}: {title}",
-                description=event_desc,
+                description=discord_desc,
                 start_time=start_dt,
                 end_time=end_dt,
                 channel=voice,
@@ -584,19 +608,22 @@ class MovieModal(discord.ui.Modal, title="Schedule a Watch Party"):
         # Post the announcement, unless it's been toggled off for this server.
         announce_note = ""
         if conf.get("announce_enabled", True):
-            post = f"{body}\n\n:calendar_spiral: **Event:** {event_url}"
+            footer = f"\n\n:calendar_spiral: **Event:** {event_url}"
+            prefix = ""
             allowed = discord.AllowedMentions.none()
             ping_role = (guild.get_role(conf["ping_role_id"])
                          if conf.get("ping_role_id") else None)
             if ping_role:
                 if ping_role.is_default():
-                    post = f"@everyone\n{post}"
+                    prefix = "@everyone\n"
                     allowed = discord.AllowedMentions(everyone=True)
                 else:
-                    post = f"{ping_role.mention}\n{post}"
+                    prefix = f"{ping_role.mention}\n"
                     allowed = discord.AllowedMentions(roles=[ping_role])
-            if len(post) > 2000:
-                post = post[:1990]
+            post = prefix + discord_announcement(
+                body, runtime_min, ratings,
+                limit=2000 - len(prefix) - len(footer),
+            ) + footer
             try:
                 kwargs = {"allowed_mentions": allowed}
                 if img_bytes:
@@ -689,7 +716,7 @@ class MovieModal(discord.ui.Modal, title="Schedule a Watch Party"):
 
         await interaction.followup.send(
             f"✅ Scheduled **{title}** for <t:{unix}:F>, created the event"
-            f"{announce_note}.\n{event_url}{vrc_note}",
+            f"{announce_note}.\n{event_url}{vrc_note}{ratings_note}",
             ephemeral=True)
         log(f"/movie by {interaction.user} in guild {guild.id}: "
             f"'{title}' @ {start_dt.isoformat()} event={event.id}")
@@ -1372,12 +1399,18 @@ async def on_guild_join(guild: discord.Guild):
 
 
 def main():
+    global RATINGS_API_KEY
     token = os.environ.get("MOVIE_BOT_TOKEN", "").strip()
     if not token and TOKEN_FILE.exists():
         token = TOKEN_FILE.read_text().strip()
     if not token:
         log(f"FATAL: no token. Set MOVIE_BOT_TOKEN or create {TOKEN_FILE}")
         raise SystemExit(1)
+    try:
+        RATINGS_API_KEY = load_api_key()
+        log("MDBList ratings credential loaded.")
+    except RatingsError as exc:
+        log(f"WARN: ratings unavailable at startup: {exc}")
     TMP_DIR.mkdir(parents=True, exist_ok=True)
     log("Starting Movie Night bot.")
     client.run(token, log_handler=None)

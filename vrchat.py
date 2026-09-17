@@ -219,6 +219,33 @@ def _create_event_sync(cookies, group_id, payload):
     if status not in (200, 201):
         raise VRChatError(
             _err_message(raw) or f"could not create event ({status})", status)
+    event = json.loads(raw) if raw else {}
+    problems = []
+    if event.get("isDraft") is True:
+        problems.append("VRChat left the event as a draft")
+    if not event.get("platforms"):
+        problems.append("VRChat returned no target platforms")
+    if problems:
+        calendar_id = event.get("id")
+        if calendar_id:
+            _request(
+                "DELETE", f"/calendar/{group_id}/{calendar_id}",
+                cookies=cookies)
+        raise VRChatError("; ".join(problems), status)
+    return event
+
+
+def _update_event_sync(cookies, group_id, calendar_id, payload):
+    status, raw, _ = _request(
+        "PUT", f"/calendar/{group_id}/{calendar_id}/event",
+        cookies=cookies, body=payload)
+    if status == 401:
+        raise VRChatAuthError("VRChat session expired.", 401)
+    if status == 404:
+        raise VRChatError("VRChat calendar event no longer exists.", 404)
+    if status != 200:
+        raise VRChatError(
+            _err_message(raw) or f"could not update event ({status})", status)
     return json.loads(raw) if raw else {}
 
 
@@ -285,6 +312,11 @@ async def create_event(cookies, group_id, payload):
     return await asyncio.to_thread(_create_event_sync, cookies, group_id, payload)
 
 
+async def update_event(cookies, group_id, calendar_id, payload):
+    return await asyncio.to_thread(
+        _update_event_sync, cookies, group_id, calendar_id, payload)
+
+
 async def delete_event(cookies, group_id, calendar_id):
     return await asyncio.to_thread(
         _delete_event_sync, cookies, group_id, calendar_id)
@@ -316,6 +348,7 @@ def build_event_payload(title, description, starts_at_utc, ends_at_utc, *,
         "category": category,
         "accessType": access_type if access_type in ("group", "public") else "group",
         "sendCreationNotification": bool(send_notification),
+        "isDraft": False,
         "platforms": plats,
     }
     if image_id:

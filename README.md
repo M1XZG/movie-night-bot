@@ -38,6 +38,10 @@ own channels, ping role and timezone.
   the bot shells out to `copilot -p ... --silent` to write the announcement and
   a synopsis + fun facts for the event. Falls back to a plain template if
   Copilot isn't available (toggle with `use_copilot` in `config.json`).
+- **IMDb and Rotten Tomatoes ratings** from MDBList appear below Runtime in
+  Discord announcements and in the Discord event description. Rotten Tomatoes
+  means the critics' score, not the audience score. These scores are fetched
+  separately from the AI copy and are never added to VRChat event descriptions.
 - **VRChat group calendar (optional):** if a server links a VRChat group, each
   movie night also creates a **VRChat group calendar event**, and `/movie-cancel`
   removes it too. See [VRChat integration](#vrchat-integration-optional).
@@ -64,6 +68,7 @@ Per-guild state lives in JSON files next to `bot.py`:
 | File | Purpose | Committed? |
 | --- | --- | --- |
 | `token` | bot token (or use `MOVIE_BOT_TOKEN`) | no (gitignored) |
+| `mdblist.key` | optional private ratings key file; `pass` is the default | no (gitignored) |
 | `config.json` | global defaults | no |
 | `guilds.json` | per-guild channel/role/tz config | no |
 | `events.json` | scheduled events the bot created (for cancel) | no |
@@ -123,6 +128,48 @@ echo "YOUR_BOT_TOKEN" > token && chmod 600 token   # or export MOVIE_BOT_TOKEN
 
 .venv/bin/python bot.py
 ```
+
+### Ratings setup
+
+Create an API key in [MDBList's preferences](https://mdblist.com/preferences/#api),
+then store it with the Linux password manager:
+
+```bash
+pass insert api/mdblist
+```
+
+The bot reads that entry at startup and keeps the key only in process memory.
+It never logs the key or puts it in event records. `pass` and the relevant GPG
+key must be available to the account running the bot. If GPG needs unlocking,
+the lookup reports an error instead of opening an interactive prompt in the
+service. After unlocking, the next scheduling attempt can retry.
+
+For another setup, use `MDBLIST_PASS_ENTRY` to select a different entry,
+`MDBLIST_API_KEY` for an environment-provided key, or `MDBLIST_API_KEY_FILE`
+for a private file outside the checkout. Environment key, explicit key file,
+then `pass` is the lookup order. Restart the bot after rotating a loaded key.
+
+MDBList search uses a year hint that can include neighbouring years. The bot
+checks the exact title and requested year before using a score and refuses
+ambiguous matches. Supply the year for remakes or common titles.
+
+If MDBList omits a score, that source is shown as **unavailable**. Provider or
+credential failures also produce a private warning to the scheduling mod;
+the movie can still be scheduled. The bot does not substitute TMDB, audience
+or composite scores for either requested source.
+
+Ratings are a snapshot supplied by MDBList, with attribution in the Discord
+output. They may differ from a later visit to the original sites. Existing
+events and announcements are not backfilled automatically.
+
+### Tests
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+The tests mock the provider and Discord/VRChat network calls. No real key,
+Discord event or announcement is used.
 
 ### Run as a systemd user service
 
@@ -258,6 +305,12 @@ Once linked, every `/movie` also creates a VRChat group calendar event
 start/end times; `/movie-cancel` deletes it (`DELETE /calendar/{groupId}/{calendarId}`).
 Pass `vrchat:False` on `/movie` to skip the VRChat event for a single
 Discord-only watch party.
+
+Events are explicitly published with `isDraft:false` and target Windows,
+Android and iOS clients. The bot also checks the create response and removes
+the event instead of reporting success if VRChat leaves it as a draft or
+returns no target platforms. Both fields are required for reliable in-client
+start notifications.
 
 **Early start (optional).** VRChat only fires its "event starting soon"
 announcement when the event begins, so the notice can arrive after the movie has
