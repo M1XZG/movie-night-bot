@@ -31,6 +31,7 @@ class MovieRatings:
     rotten_tomatoes: str | None = None
     imdb_id: str | None = None
     rotten_tomatoes_url: str | None = None
+    provider: str = "MDBList"
 
     def missing_message(self) -> str:
         missing = []
@@ -364,7 +365,8 @@ def _fetch_mdblist_ratings(
         if source == "tomatoes":
             rotten_url = _rotten_url(entry.get("url"))
     return MovieRatings(
-        scores.get("imdb"), scores.get("tomatoes"), _identifier(data, "imdb"), rotten_url,
+        scores.get("imdb"), scores.get("tomatoes"), _identifier(data, "imdb"),
+        rotten_url, "MDBList",
     )
 
 
@@ -421,7 +423,7 @@ def _fetch_omdb_ratings(
             raw_imdb = data.get("imdbRating")
             if raw_imdb not in (None, "", "N/A"):
                 imdb = _score(raw_imdb, imdb=True)
-        return MovieRatings(imdb, rotten, imdb_id)
+        return MovieRatings(imdb, rotten, imdb_id, None, "OMDb")
     return None
 
 
@@ -466,6 +468,12 @@ def _runtime(minutes: int) -> str:
 def _rating_lines(ratings: MovieRatings, *, markdown: bool) -> str:
     imdb = ratings.imdb or "unavailable"
     rotten = ratings.rotten_tomatoes or "unavailable"
+    provider_name = ratings.provider if ratings.provider in ("OMDb", "MDBList") else "MDBList"
+    provider_url = (
+        "https://www.omdbapi.com/"
+        if provider_name == "OMDb"
+        else "https://mdblist.com/"
+    )
     if markdown:
         if ratings.imdb and ratings.imdb_id:
             imdb = f"[{imdb}](https://www.imdb.com/title/{ratings.imdb_id}/)"
@@ -473,11 +481,11 @@ def _rating_lines(ratings: MovieRatings, *, markdown: bool) -> str:
             rotten = f"[{rotten}]({ratings.rotten_tomatoes_url})"
         lines = f":star: **IMDb:** {imdb}\n:tomato: **Rotten Tomatoes (critics):** {rotten}"
         if ratings.imdb or ratings.rotten_tomatoes:
-            lines += "\n_Ratings via [MDBList](https://mdblist.com/)._"
+            lines += f"\n_Ratings via [{provider_name}]({provider_url})._"
         return lines
     lines = f"IMDb: {imdb}\nRotten Tomatoes (critics): {rotten}"
     if ratings.imdb or ratings.rotten_tomatoes:
-        lines += "\nRatings via MDBList: https://mdblist.com/"
+        lines += f"\nRatings via {provider_name}: {provider_url}"
     return lines
 
 
