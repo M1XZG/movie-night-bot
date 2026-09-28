@@ -23,7 +23,10 @@ import asyncio
 import base64
 import http.cookies
 import json
+import re
 import secrets
+import time
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -211,12 +214,51 @@ def _current_user_sync(cookies):
     return data
 
 
+def _normalise_event_title(value):
+    value = unicodedata.normalize("NFKD", value or "").casefold()
+    return " ".join(re.findall(r"[a-z0-9]+", value))
+
+
+def _normalise_event_time(value):
+    return re.sub(r"\.\d{3}Z$", "Z", value or "")
+
+
+def _find_created_event_sync(cookies, group_id, payload):
+    """Find an event that VRChat created despite returning a server error."""
+    status, raw, _ = _request(
+        "GET", f"/calendar/{group_id}?n=100&offset=0", cookies=cookies)
+    if status != 200:
+        return None
+    try:
+        results = json.loads(raw).get("results", [])
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+    expected_title = _normalise_event_title(payload.get("title"))
+    expected_start = _normalise_event_time(payload.get("startsAt"))
+    expected_end = _normalise_event_time(payload.get("endsAt"))
+    matches = [
+        event for event in results
+        if _normalise_event_title(event.get("title")) == expected_title
+        and _normalise_event_time(event.get("startsAt")) == expected_start
+        and _normalise_event_time(event.get("endsAt")) == expected_end
+    ]
+    return matches[0] if len(matches) == 1 else None
+
+
 def _create_event_sync(cookies, group_id, payload):
     status, raw, _ = _request(
         "POST", f"/calendar/{group_id}/event", cookies=cookies, body=payload)
     if status == 401:
         raise VRChatAuthError("VRChat session expired.", 401)
     if status not in (200, 201):
+        if status >= 500:
+            for attempt in range(3):
+                event = _find_created_event_sync(cookies, group_id, payload)
+                if event:
+                    return event
+                if attempt < 2:
+                    time.sleep(1)
         raise VRChatError(
             _err_message(raw) or f"could not create event ({status})", status)
     event = json.loads(raw) if raw else {}
