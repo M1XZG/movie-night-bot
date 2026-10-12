@@ -1,6 +1,8 @@
 # Secrets & per-instance state
 token
 mdblist.key
+tmdb.key
+tmdb.token
 config.json
 guilds.json
 events.json
