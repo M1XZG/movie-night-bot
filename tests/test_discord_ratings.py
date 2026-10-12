@@ -10,7 +10,8 @@ from ratings import MovieRatings, RatingsError
 
 class DiscordRatingsTests(unittest.IsolatedAsyncioTestCase):
     async def run_submission(self, *, lookup_error=False, announce_enabled=True, enriched=True,
-                             backdrop_error=False, with_image=False, upload_error=False):
+                             backdrop_error=False, with_image=False, upload_error=False,
+                             imdb_id=None, title="The Matrix", year="1999", ratings_id="tt0133093"):
         voice = SimpleNamespace(id=11, mention="<#11>")
         announce = SimpleNamespace(id=12, mention="<#12>", send=AsyncMock(return_value=SimpleNamespace(id=99)))
         guild = SimpleNamespace(
@@ -25,9 +26,9 @@ class DiscordRatingsTests(unittest.IsolatedAsyncioTestCase):
         modal = SimpleNamespace(
             conf={"timezone": "UTC", "voice_channel_id": 11, "announce_channel_id": 12,
                   "announce_enabled": announce_enabled},
-            show_type="movie", make_vrchat=True, image=None,
+            show_type="movie", make_vrchat=True, image=None, imdb_id=imdb_id,
             date=SimpleNamespace(value="2099-01-07"), start=SimpleNamespace(value="19:00"),
-            movie=SimpleNamespace(value="The Matrix"), year=SimpleNamespace(value="1999"),
+            movie=SimpleNamespace(value=title), year=SimpleNamespace(value=year),
             runtime=SimpleNamespace(value="136"),
         )
         description = "Original synopsis.\nFun facts:\n- Original fact."
@@ -55,7 +56,7 @@ class DiscordRatingsTests(unittest.IsolatedAsyncioTestCase):
                 upload.side_effect = bot.vrchat.VRChatAuthError("expired")
             stack.enter_context(patch.object(bot.vrchat, "upload_image", upload))
             stack.enter_context(patch.object(bot, "enrich_with_copilot", AsyncMock(return_value=enrichment)))
-            lookup = Mock(return_value=MovieRatings("8.7/10", "83%", "tt0133093"))
+            lookup = Mock(return_value=MovieRatings("8.7/10", "83%", ratings_id))
             if lookup_error:
                 lookup.side_effect = RatingsError("MDBList could not be reached.")
             stack.enter_context(patch.object(bot, "fetch_ratings", lookup))
@@ -66,7 +67,16 @@ class DiscordRatingsTests(unittest.IsolatedAsyncioTestCase):
             stack.enter_context(patch.object(bot.vrchat, "create_event", vrc_create))
             stack.enter_context(patch.object(bot, "add_event_record", record))
             stack.enter_context(patch.object(bot, "log", log))
+            calls = Mock()
+            calls.attach_mock(lookup, "ratings")
+            calls.attach_mock(backdrop, "backdrop")
             await bot.MovieModal.on_submit(modal, interaction)
+            self.assertLess(
+                next(i for i, call in enumerate(calls.mock_calls) if call[0] == "ratings"),
+                next(i for i, call in enumerate(calls.mock_calls) if call[0] == "backdrop"),
+            )
+            expected_id = imdb_id or (None if lookup_error else ratings_id)
+            self.assertEqual(backdrop.await_args.kwargs["imdb_id"], expected_id)
         return guild, announce, vrc_create, interaction, record, log, description
 
     async def test_scores_are_in_discord_but_never_added_to_vrchat(self):
@@ -130,6 +140,21 @@ class DiscordRatingsTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("imageId", vrc.await_args.args[2])
         self.assertIn("VRChat image upload failed: session expired.", interaction.followup.send.await_args.args[0])
         self.assertNotIn("vrc_file_id", record.call_args.args[1])
+
+    async def test_runner_identity_is_shared_with_backdrop_and_persisted(self):
+        _, _, _, _, record, _, _ = await self.run_submission(
+            title="Runner", year="2026", ratings_id="tt31349844", with_image=True,
+        )
+        self.assertEqual(record.call_args.args[1]["imdb_id"], "tt31349844")
+
+    async def test_explicit_imdb_override_does_not_show_scores_from_another_film(self):
+        guild, announce, _, interaction, record, _, _ = await self.run_submission(
+            imdb_id="tt1234567", with_image=True,
+        )
+        self.assertIn("IMDb: unavailable", guild.create_scheduled_event.await_args.kwargs["description"])
+        self.assertNotIn("8.7/10", announce.send.await_args.kwargs["content"])
+        self.assertIn("Ratings did not match", interaction.followup.send.await_args.args[0])
+        self.assertEqual(record.call_args.args[1]["imdb_id"], "tt1234567")
 
 
 if __name__ == "__main__":
