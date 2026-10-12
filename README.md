@@ -188,14 +188,25 @@ private file through `TMDB_TOKEN_FILE` or `TMDB_API_KEY_FILE`. Environment
 credentials take precedence over explicit files, then `pass`; `TMDB_PASS_ENTRY`
 changes the entry name. Never commit a credential.
 
-Image lookup requires one exact title/year match, uses the movie or TV
-catalogue appropriate to the chosen type, and supports parent-series lookup
-for TV/anime episode titles. Ambiguous matches are reported instead of
-selecting the first film. Supply the release year for remakes.
+The ratings lookup runs first. When it identifies an IMDb title, the bot uses
+that identifier to find the same movie or series on TMDB rather than searching
+again by name. This avoids confusing films that share both a title and a year.
+The TMDB result must still match the requested title, year and media type.
+That identity is also supplied to the text generator and saved in the event record.
+
+Use `/movie imdb:tt31349844` to pin a particular film or series explicitly.
+If the ratings provider returns a different IMDb identity, its scores are
+omitted with a warning rather than showing another film's ratings.
+
+Without an IMDb identity, lookup requires one exact title/year match and checks
+up to five search pages. It uses the movie or TV catalogue appropriate to the
+chosen type and supports parent-series lookup for TV/anime episode titles.
+Ambiguous matches are reported instead of selecting the first film. Supply
+the release year for remakes; title and year alone can still be ambiguous.
 
 Backdrops are fully decoded and converted to 1280 x 720 JPEGs before being
 used on Discord and converted to PNG for VRChat. Successful lookups are
-cached by title, year and show type under `tmp/backdrops/` next to the bot,
+cached by title, year, show type and available IMDb identity under `tmp/backdrops/` next to the bot,
 or under `MOVIE_BOT_TMP/backdrops/`. Valid cached images work without an
 API request or credential. Invalid cached files are reported and refreshed.
 To fetch a newer image for a title, remove its individual cached JPEG.
@@ -211,6 +222,7 @@ The standalone helper keeps its original title/year interface:
 
 ```bash
 python3 find_backdrop.py "Secondhand Lions" 2003
+python3 find_backdrop.py "Runner" 2026 --imdb-id tt31349844
 python3 find_backdrop.py "A Series episode 10" 2026 --show-type tv
 ```
 

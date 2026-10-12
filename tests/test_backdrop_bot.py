@@ -10,11 +10,11 @@ from find_backdrop import BackdropError
 class BackdropBotTests(unittest.IsolatedAsyncioTestCase):
     async def test_subprocess_failure_is_logged_and_reported(self):
         process = SimpleNamespace(
-            returncode=1, communicate=AsyncMock(return_value=(b"NONE\n", b"TMDB returned HTTP 403.\n")),
+            returncode=1, communicate=AsyncMock(return_value=(b"NONE\n", b"ERROR: TMDB returned HTTP 403.\n")),
         )
         with patch.object(bot.asyncio, "create_subprocess_exec", AsyncMock(return_value=process)), \
                 patch.object(bot, "log") as log:
-            with self.assertRaisesRegex(BackdropError, "Check bot.log"):
+            with self.assertRaisesRegex(BackdropError, "TMDB returned HTTP 403"):
                 await bot.fetch_backdrop("A Movie", "2003")
         self.assertIn("HTTP 403", log.call_args.args[0])
 
@@ -62,6 +62,29 @@ class BackdropBotTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any("not endorsed or certified" in field.value
                             for field in sent["embed"].fields))
         sent["file"].close()
+
+    async def test_imdb_option_is_available_and_retained_by_modal(self):
+        modal = bot.MovieModal({}, imdb_id="tt31349844")
+        self.assertEqual(modal.imdb_id, "tt31349844")
+        parameter = next(item for item in bot.movie.parameters if item.name == "imdb")
+        self.assertFalse(parameter.required)
+        self.assertEqual(parameter.type, bot.discord.AppCommandOptionType.string)
+
+    async def test_invalid_imdb_option_rejected_before_modal(self):
+        interaction = SimpleNamespace(response=SimpleNamespace(send_message=AsyncMock(), send_modal=AsyncMock()))
+        await bot.movie.callback(interaction, imdb="not-an-id")
+        interaction.response.send_modal.assert_not_awaited()
+        self.assertIn("IMDb identifier", interaction.response.send_message.await_args.args[0])
+
+    async def test_unstructured_traceback_not_shown_to_scheduling_mod(self):
+        process = SimpleNamespace(
+            returncode=1, communicate=AsyncMock(return_value=(b"", b"Traceback\nsecret URL\n")),
+        )
+        with patch.object(bot.asyncio, "create_subprocess_exec", AsyncMock(return_value=process)), \
+                patch.object(bot, "log"):
+            with self.assertRaisesRegex(BackdropError, "Check bot.log") as error:
+                await bot.fetch_backdrop("A Movie", None)
+        self.assertNotIn("secret URL", str(error.exception))
 
 
 if __name__ == "__main__":

@@ -50,7 +50,7 @@ from discord import app_commands
 import vrchat
 from find_backdrop import BackdropError, MAX_IMAGE_BYTES, manual_backdrop
 from ratings import (
-    MovieRatings, RatingsError, discord_announcement,
+    IMDB_ID, MovieRatings, RatingsError, discord_announcement,
     discord_event_description, fetch_ratings, load_api_key,
     load_omdb_api_key,
 )
@@ -223,7 +223,8 @@ def clear_gconf(guild_id: int) -> bool:
 # --------------------------------------------------------------------------- #
 async def fetch_backdrop(title: str, year: str | None,
                          show_type: str = "movie",
-                         image: discord.Attachment | None = None) -> Path:
+                         image: discord.Attachment | None = None,
+                         *, imdb_id: str | None = None) -> Path:
     if image is not None:
         if image.size > MAX_IMAGE_BYTES:
             raise BackdropError("The manual backdrop must be smaller than 8 MB.")
@@ -236,6 +237,8 @@ async def fetch_backdrop(title: str, year: str | None,
     if year:
         cmd.append(str(year))
     cmd.extend(["--show-type", show_type])
+    if imdb_id:
+        cmd.extend(["--imdb-id", imdb_id])
     env = dict(os.environ, MOVIE_BOT_TMP=str(TMP_DIR))
     proc = None
     try:
@@ -246,6 +249,12 @@ async def fetch_backdrop(title: str, year: str | None,
         if err:
             log(f"backdrop lookup: {err.decode(errors='replace').strip()}")
         if proc.returncode:
+            reasons = [
+                line.removeprefix("ERROR: ") for line in err.decode(errors="replace").splitlines()
+                if line.startswith("ERROR: ")
+            ]
+            if reasons:
+                raise BackdropError(reasons[-1][:500])
             raise BackdropError(
                 "TMDB backdrop lookup failed. Check bot.log or supply an image with `/movie image:`."
             )
@@ -358,7 +367,8 @@ def find_copilot() -> str | None:
 
 
 async def enrich_with_copilot(title, year, unix, runtime_min,
-                              show_type="movie", label="Movie Night") -> dict | None:
+                              show_type="movie", label="Movie Night",
+                              imdb_id: str | None = None) -> dict | None:
     """Ask Copilot CLI for the announcement body AND a short event blurb.
 
     Returns {"announcement": str, "event_description": str} or None on failure.
@@ -374,10 +384,14 @@ async def enrich_with_copilot(title, year, unix, runtime_min,
     noun = SHOW_TYPE_NOUN.get(show_type, "film")
     runtime_label = ("episode/season runtime" if show_type in ("tv", "anime")
                      else "Runtime")
+    identity_note = (
+        f" Use IMDb title {imdb_id}; do not confuse it with other titles "
+        "with the same name." if imdb_id else ""
+    )
     prompt = (
         "You are writing content for a Discord watch-party bot. Research the "
         f"{noun} \"{title}\"{yr} from your own knowledge and produce fun, "
-        "accurate content. Keep facts accurate; if unsure about a detail, omit "
+        f"accurate content.{identity_note} Keep facts accurate; if unsure about a detail, omit "
         "it. Do not invent a runtime if unknown. Do not include IMDb, Rotten "
         "Tomatoes, or other review scores; the bot looks those up separately.\n\n"
         "Output ONLY a JSON object (no markdown fences, no commentary) with "
@@ -482,12 +496,14 @@ class MovieModal(discord.ui.Modal, title="Schedule a Watch Party"):
                  make_vrchat: bool = True,
                  prefill_date: str | None = None,
                  prefill_time: str | None = None,
-                 image: discord.Attachment | None = None):
+                 image: discord.Attachment | None = None,
+                 imdb_id: str | None = None):
         super().__init__(timeout=600)
         self.conf = conf
         self.show_type = show_type if show_type in LABEL_MATRIX else "movie"
         self.make_vrchat = make_vrchat
         self.image = image
+        self.imdb_id = imdb_id
 
         # Fields are built here (not as class attributes) so the date/time can be
         # pre-filled per invocation with the next suggested slot. Defaults stay
@@ -563,11 +579,33 @@ class MovieModal(discord.ui.Modal, title="Schedule a Watch Party"):
         # Type + daypart aware wording (e.g. "Anime Matinée", "Movie Night").
         label, emoji = label_for(self.show_type, start_dt)
 
+        ratings = MovieRatings()
+        try:
+            if RATINGS_API_KEY is None:
+                RATINGS_API_KEY = await asyncio.to_thread(load_api_key)
+            ratings = await asyncio.to_thread(
+                fetch_ratings, title, yr, self.show_type,
+                api_key=RATINGS_API_KEY,
+                omdb_api_key=OMDB_API_KEY or None)
+            if self.imdb_id and ratings.imdb_id != self.imdb_id:
+                ratings = MovieRatings()
+                ratings_warning = "Ratings did not match the supplied IMDb identifier; scores omitted."
+            else:
+                ratings_warning = ratings.missing_message()
+        except RatingsError as exc:
+            ratings_warning = str(exc)
+        ratings_note = ""
+        if ratings_warning:
+            log(f"WARN: movie ratings unavailable: {ratings_warning}")
+            ratings_note = f"\n:warning: Ratings: {ratings_warning}"
+        imdb_id = self.imdb_id or ratings.imdb_id
+
         image_note = ""
         img_path = None
         img_bytes = None
         try:
-            img_path = await fetch_backdrop(title, yr, self.show_type, self.image)
+            img_path = await fetch_backdrop(
+                title, yr, self.show_type, self.image, imdb_id=imdb_id)
             img_bytes = img_path.read_bytes()
         except (BackdropError, OSError) as exc:
             warning = str(exc) if isinstance(exc, BackdropError) else "The downloaded backdrop could not be read."
@@ -576,7 +614,7 @@ class MovieModal(discord.ui.Modal, title="Schedule a Watch Party"):
 
         # Generate rich content once (announcement body + event blurb).
         enriched = await enrich_with_copilot(
-            title, yr, unix, runtime_min, self.show_type, label)
+            title, yr, unix, runtime_min, self.show_type, label, imdb_id=imdb_id)
         if enriched:
             body = enriched["announcement"]
             event_desc = enriched.get("event_description") or ""
@@ -589,21 +627,6 @@ class MovieModal(discord.ui.Modal, title="Schedule a Watch Party"):
                           "Grab snacks and join us!")
         event_desc = event_desc[:1000]
 
-        ratings = MovieRatings()
-        try:
-            if RATINGS_API_KEY is None:
-                RATINGS_API_KEY = await asyncio.to_thread(load_api_key)
-            ratings = await asyncio.to_thread(
-                fetch_ratings, title, yr, self.show_type,
-                api_key=RATINGS_API_KEY,
-                omdb_api_key=OMDB_API_KEY or None)
-            ratings_warning = ratings.missing_message()
-        except RatingsError as exc:
-            ratings_warning = str(exc)
-        ratings_note = ""
-        if ratings_warning:
-            log(f"WARN: movie ratings unavailable: {ratings_warning}")
-            ratings_note = f"\n:warning: Ratings: {ratings_warning}"
         discord_desc = discord_event_description(
             event_desc, runtime_min, ratings, announcement=body)
 
@@ -644,6 +667,7 @@ class MovieModal(discord.ui.Modal, title="Schedule a Watch Party"):
             "title": title,
             "year": yr,
             "show_type": self.show_type,
+            "imdb_id": imdb_id,
             "unix": unix,
         }
 
@@ -778,7 +802,8 @@ class MovieModal(discord.ui.Modal, title="Schedule a Watch Party"):
 @app_commands.describe(
     type="What you're showing — adapts the wording (default: Movie).",
     vrchat="Also create a VRChat group event? (default: yes when linked).",
-    image="Optional landscape image to use instead of TMDB (JPEG/PNG/WebP, under 8 MB).")
+    image="Optional landscape image to use instead of TMDB (JPEG/PNG/WebP, under 8 MB).",
+    imdb="Optional IMDb identifier, e.g. tt31349844, to resolve titles with the same name.")
 @app_commands.choices(type=[
     app_commands.Choice(name="🎬 Movie", value="movie"),
     app_commands.Choice(name="📺 TV Series", value="tv"),
@@ -788,7 +813,15 @@ class MovieModal(discord.ui.Modal, title="Schedule a Watch Party"):
 async def movie(interaction: discord.Interaction,
                 type: app_commands.Choice[str] | None = None,
                 vrchat: bool | None = None,
-                image: discord.Attachment | None = None):
+                image: discord.Attachment | None = None,
+                imdb: str | None = None):
+    if imdb is not None:
+        imdb = imdb.strip()
+        if not IMDB_ID.fullmatch(imdb):
+            await interaction.response.send_message(
+                "⚠️ Use an IMDb identifier such as `tt31349844`, not a title or URL.",
+                ephemeral=True)
+            return
     conf = gconf(interaction.guild_id)
     needed = ("mod_channel_id", "announce_channel_id", "voice_channel_id")
     missing = [k for k in needed if k not in conf]
@@ -813,7 +846,7 @@ async def movie(interaction: discord.Interaction,
         tz = ZoneInfo(CFG["default_timezone"])
     prefill_date, prefill_time = next_slot_prefill(interaction.guild_id, tz)
     await interaction.response.send_modal(
-        MovieModal(conf, show_type, make_vrchat, prefill_date, prefill_time, image))
+        MovieModal(conf, show_type, make_vrchat, prefill_date, prefill_time, image, imdb))
 
 
 @tree.command(name="movie-help",
@@ -835,7 +868,8 @@ async def movie_help(interaction: discord.Interaction):
                "**vrchat:False** for a Discord-only watch party (skips the "
                "VRChat event even when linked). *Only works in the configured "
                "mod channel.* Use **image:** to attach a landscape backdrop "
-               "instead of looking it up on TMDB.\n"
+               "instead of looking it up on TMDB. Use **imdb:** to identify "
+               "a particular film or series when names overlap.\n"
                "**/movie-test** — dry-run that checks config & permissions "
                "without posting anything. Run this first.\n"
                "**/movie-cancel** — pick an upcoming movie night to delete its "

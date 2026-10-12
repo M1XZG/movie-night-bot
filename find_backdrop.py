@@ -19,7 +19,7 @@ from urllib.request import Request, urlopen
 
 from PIL import Image, ImageOps, UnidentifiedImageError
 
-from ratings import _normal_title, _search_titles
+from ratings import IMDB_ID, _normal_title, _search_titles
 
 API = "https://api.themoviedb.org/3"
 IMAGE_BASE = "https://image.tmdb.org/t/p/w1280"
@@ -27,6 +27,7 @@ TMP = Path(os.environ.get("MOVIE_BOT_TMP", Path(__file__).resolve().parent / "tm
 MAX_JSON_BYTES = 1_000_000
 MAX_IMAGE_BYTES = 8_000_000
 TIMEOUT = 8
+MAX_SEARCH_PAGES = 5
 IMAGE_PATH = re.compile(r"/[A-Za-z0-9_-]+\.(?:jpg|png)\Z")
 
 
@@ -122,46 +123,77 @@ def _request(credential: Credential, path: str, **params) -> dict:
 
 def find_title(
     title: str, year: str | None, show_type: str, credential: Credential,
+    imdb_id: str | None = None,
 ) -> tuple[str, int]:
     kinds = {"movie": ("movie",), "tv": ("tv",)}.get(show_type, ("tv", "movie"))
-    for search_title in _search_titles(title, show_type):
+    titles = _search_titles(title, show_type)
+    if imdb_id:
+        if not IMDB_ID.fullmatch(imdb_id):
+            raise BackdropError("Use an IMDb identifier such as tt31349844.")
+        data = _request(credential, f"/find/{imdb_id}", external_source="imdb_id")
+        matches = set()
+        for kind in kinds:
+            results = data.get(f"{kind}_results")
+            if not isinstance(results, list):
+                raise BackdropError("TMDB returned invalid IMDb lookup results.")
+            for item in results:
+                identifier = _matching_id(item, titles, year, kind)
+                if identifier is not None:
+                    matches.add((kind, identifier))
+        if len(matches) == 1:
+            return next(iter(matches))
+        raise BackdropError(
+            "TMDB could not uniquely match this IMDb identifier to the requested title, year and type."
+        )
+    for search_title in titles:
         matches = {}
         for kind in kinds:
             params = {"query": search_title, "include_adult": "false"}
             if year:
                 params["year" if kind == "movie" else "first_air_date_year"] = year
             data = _request(credential, f"/search/{kind}", **params)
-            results = data.get("results")
-            if not isinstance(results, list):
-                raise BackdropError("TMDB returned invalid search results.")
             pages = data.get("total_pages", 1)
             if isinstance(pages, bool) or not isinstance(pages, int) or pages < 0:
                 raise BackdropError("TMDB returned an invalid search page count.")
-            if pages > 1:
+            if pages > MAX_SEARCH_PAGES:
                 raise BackdropError(
-                    "TMDB returned too many candidates; use a manual backdrop."
+                    "TMDB returned too many candidates; use `/movie imdb:` or a manual backdrop."
                 )
-            for item in results:
-                if not isinstance(item, dict):
-                    raise BackdropError("TMDB returned an invalid title.")
-                identifier = item.get("id")
-                names = (item.get("title"), item.get("original_title")) if kind == "movie" else (
-                    item.get("name"), item.get("original_name"),
-                )
-                date = item.get("release_date" if kind == "movie" else "first_air_date")
-                if not any(isinstance(name, str) and _normal_title(name) == _normal_title(search_title)
-                           for name in names):
-                    continue
-                if year and (not isinstance(date, str) or date[:4] != year):
-                    continue
-                if isinstance(identifier, bool) or not isinstance(identifier, int) or identifier <= 0:
-                    raise BackdropError("TMDB returned an invalid title identifier.")
-                matches[kind, identifier] = None
+            for page in range(1, max(pages, 1) + 1):
+                if page > 1:
+                    data = _request(credential, f"/search/{kind}", **params, page=page)
+                results = data.get("results")
+                if not isinstance(results, list):
+                    raise BackdropError("TMDB returned invalid search results.")
+                for item in results:
+                    identifier = _matching_id(item, [search_title], year, kind)
+                    if identifier is not None:
+                        matches[kind, identifier] = None
         if len(matches) == 1:
             return next(iter(matches))
         if matches:
-            raise BackdropError("The title is ambiguous on TMDB; specify its year or a manual backdrop.")
+            raise BackdropError(
+                "Multiple TMDB films/shows match this title and year; use `/movie imdb:` or a manual backdrop."
+            )
     raise BackdropError("No exact title/year match was found on TMDB; use a manual backdrop.")
+
+
+def _matching_id(item, titles: list[str], year: str | None, kind: str) -> int | None:
+    if not isinstance(item, dict):
+        raise BackdropError("TMDB returned an invalid title.")
+    names = (item.get("title"), item.get("original_title")) if kind == "movie" else (
+        item.get("name"), item.get("original_name"),
+    )
+    if not any(isinstance(name, str) and _normal_title(name) == _normal_title(title)
+               for name in names for title in titles):
+        return None
+    date = item.get("release_date" if kind == "movie" else "first_air_date")
+    if year and (not isinstance(date, str) or date[:4] != year):
+        return None
+    identifier = item.get("id")
+    if isinstance(identifier, bool) or not isinstance(identifier, int) or identifier <= 0:
+        raise BackdropError("TMDB returned an invalid title identifier.")
+    return identifier
 
 
 def _backdrop_paths(kind: str, identifier: int, credential: Credential) -> list[str]:
@@ -235,11 +267,16 @@ def manual_backdrop(data: bytes, directory: Path = TMP) -> Path:
 
 def fetch_backdrop(
     title: str, year: str | None = None, show_type: str = "movie",
-    *, directory: Path = TMP,
+    *, directory: Path = TMP, imdb_id: str | None = None,
 ) -> Path:
     if not title.strip() or (year and not re.fullmatch(r"\d{4}", year)):
         raise BackdropError("Provide a movie title and, optionally, a four-digit release year.")
-    cache_key = hashlib.sha256(json.dumps([title.strip().casefold(), year, show_type]).encode()).hexdigest()
+    if imdb_id and not IMDB_ID.fullmatch(imdb_id):
+        raise BackdropError("Use an IMDb identifier such as tt31349844.")
+    identity = [title.strip().casefold(), year, show_type]
+    if imdb_id:
+        identity.append(imdb_id)
+    cache_key = hashlib.sha256(json.dumps(identity).encode()).hexdigest()
     dest = directory / "backdrops" / f"tmdb-{cache_key}.jpg"
     if dest.exists():
         try:
@@ -249,7 +286,7 @@ def fetch_backdrop(
         except (OSError, BackdropError):
             print("WARN: cached backdrop is invalid; fetching a fresh image.", file=sys.stderr)
     credential = load_credential()
-    kind, identifier = find_title(title, year, show_type, credential)
+    kind, identifier = find_title(title, year, show_type, credential, imdb_id)
     paths = _backdrop_paths(kind, identifier, credential)
     failures = []
     for path in paths[:3]:
@@ -269,12 +306,13 @@ def main() -> int:
     parser.add_argument("title")
     parser.add_argument("year", nargs="?")
     parser.add_argument("--show-type", choices=("movie", "tv", "anime", "other"), default="movie")
+    parser.add_argument("--imdb-id")
     args = parser.parse_args()
     try:
-        print(fetch_backdrop(args.title, args.year, args.show_type))
+        print(fetch_backdrop(args.title, args.year, args.show_type, imdb_id=args.imdb_id))
         return 0
     except BackdropError as exc:
-        print(str(exc), file=sys.stderr)
+        print(f"ERROR: {exc}", file=sys.stderr)
         print("NONE")
         return 1
 
