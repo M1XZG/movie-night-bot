@@ -57,7 +57,7 @@ own channels, ping role and timezone.
 ```mermaid
 flowchart TD
     A[Mod runs /movie in mod channel] --> B[Modal: title, year, date, time, runtime]
-    B --> C[fetch_backdrop.py → TMDB 16:9 image]
+    B --> C[find_backdrop.py → TMDB API / validated image cache]
     B --> D[copilot -p --silent → JSON: announcement + event blurb]
     C --> E[create_scheduled_event in voice channel]
     D --> E
@@ -167,6 +167,65 @@ audience or composite scores.
 Ratings include attribution to the provider that supplied them. They may
 differ from a later visit to the original sites. Existing events and
 announcements are not backfilled automatically.
+
+### Backdrop images
+
+The bot uses the [official TMDB API](https://developer.themoviedb.org/docs)
+instead of scraping TMDB's website. Website search can reject automated
+requests with HTTP 403 even when the API and image CDN work.
+
+Create a developer credential in your [TMDB API settings](https://www.themoviedb.org/settings/api),
+then store the **API Read Access Token** with:
+
+```bash
+pass insert api/tmdb
+```
+
+The bot reads the first line without prompting. The service account must be
+able to decrypt that entry. A v3 API key in the same entry also works.
+Alternatively set `TMDB_READ_ACCESS_TOKEN` or `TMDB_API_KEY`, or provide a
+private file through `TMDB_TOKEN_FILE` or `TMDB_API_KEY_FILE`. Environment
+credentials take precedence over explicit files, then `pass`; `TMDB_PASS_ENTRY`
+changes the entry name. Never commit a credential.
+
+Image lookup requires one exact title/year match, uses the movie or TV
+catalogue appropriate to the chosen type, and supports parent-series lookup
+for TV/anime episode titles. Ambiguous matches are reported instead of
+selecting the first film. Supply the release year for remakes.
+
+Backdrops are fully decoded and converted to 1280 x 720 JPEGs before being
+used on Discord and converted to PNG for VRChat. Successful lookups are
+cached by title, year and show type under `tmp/backdrops/` next to the bot,
+or under `MOVIE_BOT_TMP/backdrops/`. Valid cached images work without an
+API request or credential. Invalid cached files are reported and refreshed.
+To fetch a newer image for a title, remove its individual cached JPEG.
+
+Use `/movie image:` to attach your own landscape JPEG, PNG or WebP
+(under 8 MB, at least 320 x 180) before opening the schedule form.
+This bypasses TMDB and uses the same validation and uploads for both platforms.
+If an image cannot be acquired, scheduling still works, but the mod receives
+a private warning and the failure is logged. VRChat conversion/upload failures
+are also reported privately. Existing events are not changed automatically.
+
+The standalone helper keeps its original title/year interface:
+
+```bash
+python3 find_backdrop.py "Secondhand Lions" 2003
+python3 find_backdrop.py "A Series episode 10" 2026 --show-type tv
+```
+
+It prints the cached image path on success; failures print `NONE`, return a
+non-zero exit status and explain the error on stderr.
+
+### TMDB credits
+
+![TMDB](assets/tmdb-logo.png)
+
+Backdrops are supplied by [The Movie Database](https://www.themoviedb.org).
+This product uses the TMDB API but is not endorsed or certified by TMDB.
+The bot's `/movie-help` includes the same credit and logo. The PNG is rendered
+from TMDB's [approved blue short logo](https://www.themoviedb.org/assets/v4/logos/v2/blue_short-8e7b30f73a4020692ccca9c88bafe5dcb6f8a62a4c6bc55cd9ba82bb2cd95f6c.svg)
+without changing its colours or proportions.
 
 ### Tests
 

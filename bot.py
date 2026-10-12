@@ -39,7 +39,7 @@ import datetime as dt
 import json
 import os
 import subprocess
-import tempfile
+import sys
 import time
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -48,6 +48,7 @@ import discord
 from discord import app_commands
 
 import vrchat
+from find_backdrop import BackdropError, MAX_IMAGE_BYTES, manual_backdrop
 from ratings import (
     MovieRatings, RatingsError, discord_announcement,
     discord_event_description, fetch_ratings, load_api_key,
@@ -66,7 +67,7 @@ LOG_FILE = HERE / "bot.log"
 BACKDROP_SCRIPT = HERE / "find_backdrop.py"
 # Scratch dir for downloaded images; overridable with MOVIE_BOT_TMP.
 TMP_DIR = Path(os.environ.get(
-    "MOVIE_BOT_TMP", Path(tempfile.gettempdir()) / "movie-night-bot"))
+    "MOVIE_BOT_TMP", HERE / "tmp"))
 
 DEFAULTS = {
     "default_timezone": "Europe/London",
@@ -220,22 +221,49 @@ def clear_gconf(guild_id: int) -> bool:
 # --------------------------------------------------------------------------- #
 # Helpers: backdrop, copilot enrichment, announcement template
 # --------------------------------------------------------------------------- #
-async def fetch_backdrop(title: str, year: str | None) -> Path | None:
-    cmd = ["python3", str(BACKDROP_SCRIPT), title]
+async def fetch_backdrop(title: str, year: str | None,
+                         show_type: str = "movie",
+                         image: discord.Attachment | None = None) -> Path:
+    if image is not None:
+        if image.size > MAX_IMAGE_BYTES:
+            raise BackdropError("The manual backdrop must be smaller than 8 MB.")
+        try:
+            data = await image.read()
+        except discord.HTTPException:
+            raise BackdropError("The manual backdrop attachment could not be downloaded.") from None
+        return await asyncio.to_thread(manual_backdrop, data, TMP_DIR)
+    cmd = [sys.executable, str(BACKDROP_SCRIPT), title]
     if year:
         cmd.append(str(year))
+    cmd.extend(["--show-type", show_type])
     env = dict(os.environ, MOVIE_BOT_TMP=str(TMP_DIR))
+    proc = None
     try:
         proc = await asyncio.create_subprocess_exec(
             *cmd, stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE, env=env)
-        out, _ = await asyncio.wait_for(proc.communicate(), timeout=60)
+        out, err = await asyncio.wait_for(proc.communicate(), timeout=60)
+        if err:
+            log(f"backdrop lookup: {err.decode(errors='replace').strip()}")
+        if proc.returncode:
+            raise BackdropError(
+                "TMDB backdrop lookup failed. Check bot.log or supply an image with `/movie image:`."
+            )
         path = (out or b"").decode().strip().splitlines()[-1] if out else "NONE"
         if path and path != "NONE" and Path(path).exists():
             return Path(path)
-    except (asyncio.TimeoutError, OSError, IndexError) as e:
-        log(f"backdrop fetch failed: {e}")
-    return None
+        raise BackdropError("The backdrop lookup did not produce an image.")
+    except asyncio.TimeoutError:
+        raise BackdropError("The backdrop lookup timed out; supply an image with `/movie image:`.") from None
+    except (OSError, IndexError, UnicodeError):
+        raise BackdropError("The backdrop lookup could not be run; check bot.log.") from None
+    finally:
+        if proc is not None and proc.returncode is None:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass  # The child exited before the timeout cleanup.
+            await proc.communicate()
 
 
 def _to_vrchat_png(img_bytes: bytes) -> bytes | None:
@@ -453,11 +481,13 @@ class MovieModal(discord.ui.Modal, title="Schedule a Watch Party"):
     def __init__(self, conf: dict, show_type: str = "movie",
                  make_vrchat: bool = True,
                  prefill_date: str | None = None,
-                 prefill_time: str | None = None):
+                 prefill_time: str | None = None,
+                 image: discord.Attachment | None = None):
         super().__init__(timeout=600)
         self.conf = conf
         self.show_type = show_type if show_type in LABEL_MATRIX else "movie"
         self.make_vrchat = make_vrchat
+        self.image = image
 
         # Fields are built here (not as class attributes) so the date/time can be
         # pre-filled per invocation with the next suggested slot. Defaults stay
@@ -533,9 +563,16 @@ class MovieModal(discord.ui.Modal, title="Schedule a Watch Party"):
         # Type + daypart aware wording (e.g. "Anime Matinée", "Movie Night").
         label, emoji = label_for(self.show_type, start_dt)
 
-        # Backdrop image (best-effort)
-        img_path = await fetch_backdrop(title, yr)
-        img_bytes = img_path.read_bytes() if img_path else None
+        image_note = ""
+        img_path = None
+        img_bytes = None
+        try:
+            img_path = await fetch_backdrop(title, yr, self.show_type, self.image)
+            img_bytes = img_path.read_bytes()
+        except (BackdropError, OSError) as exc:
+            warning = str(exc) if isinstance(exc, BackdropError) else "The downloaded backdrop could not be read."
+            log(f"WARN: backdrop unavailable for '{title}': {warning}")
+            image_note = f"\n:warning: No event image: {warning}"
 
         # Generate rich content once (announcement body + event blurb).
         enriched = await enrich_with_copilot(
@@ -605,6 +642,8 @@ class MovieModal(discord.ui.Modal, title="Schedule a Watch Party"):
             "message_id": None,
             "channel_id": None,
             "title": title,
+            "year": yr,
+            "show_type": self.show_type,
             "unix": unix,
         }
 
@@ -663,6 +702,7 @@ class MovieModal(discord.ui.Modal, title="Schedule a Watch Party"):
             # Upload the movie backdrop to the linked account (best-effort) so
             # the event carries it instead of the group's banner.
             vrc_image_id = None
+            vrc_image_warning = ""
             if img_bytes:
                 png = _to_vrchat_png(img_bytes)
                 if png:
@@ -674,9 +714,13 @@ class MovieModal(discord.ui.Modal, title="Schedule a Watch Party"):
                             f"{vrc_image_id}")
                     except vrchat.VRChatAuthError:
                         log(f"VRChat image upload: session expired (guild {guild.id})")
+                        vrc_image_warning = "VRChat image upload failed: session expired."
                     except vrchat.VRChatError as e:
                         log(f"VRChat image upload failed (guild {guild.id}): "
                             f"{e.message}")
+                        vrc_image_warning = f"VRChat image upload failed: {e.message}"
+                else:
+                    vrc_image_warning = "The backdrop could not be converted for VRChat."
 
             payload = vrchat.build_event_payload(
                 f"{label}: {title}", event_desc, starts, ends,
@@ -695,6 +739,8 @@ class MovieModal(discord.ui.Modal, title="Schedule a Watch Party"):
                 vrc_note = "\n:globe_with_meridians: Also posted to the VRChat group calendar."
                 if vrc_image_id:
                     vrc_note += " (with the movie image)"
+                elif vrc_image_warning:
+                    vrc_note += f"\n:warning: {vrc_image_warning}"
                 log(f"VRChat event created for guild {guild.id}: {cal_id}")
             except vrchat.VRChatAuthError:
                 vrc_note = ("\n:warning: VRChat session expired — run "
@@ -719,7 +765,7 @@ class MovieModal(discord.ui.Modal, title="Schedule a Watch Party"):
 
         await interaction.followup.send(
             f"✅ Scheduled **{title}** for <t:{unix}:F>, created the event"
-            f"{announce_note}.\n{event_url}{vrc_note}{ratings_note}",
+            f"{announce_note}.\n{event_url}{vrc_note}{ratings_note}{image_note}",
             ephemeral=True)
         log(f"/movie by {interaction.user} in guild {guild.id}: "
             f"'{title}' @ {start_dt.isoformat()} event={event.id}")
@@ -731,7 +777,8 @@ class MovieModal(discord.ui.Modal, title="Schedule a Watch Party"):
 @app_commands.default_permissions(manage_events=True)
 @app_commands.describe(
     type="What you're showing — adapts the wording (default: Movie).",
-    vrchat="Also create a VRChat group event? (default: yes when linked).")
+    vrchat="Also create a VRChat group event? (default: yes when linked).",
+    image="Optional landscape image to use instead of TMDB (JPEG/PNG/WebP, under 8 MB).")
 @app_commands.choices(type=[
     app_commands.Choice(name="🎬 Movie", value="movie"),
     app_commands.Choice(name="📺 TV Series", value="tv"),
@@ -740,7 +787,8 @@ class MovieModal(discord.ui.Modal, title="Schedule a Watch Party"):
 ])
 async def movie(interaction: discord.Interaction,
                 type: app_commands.Choice[str] | None = None,
-                vrchat: bool | None = None):
+                vrchat: bool | None = None,
+                image: discord.Attachment | None = None):
     conf = gconf(interaction.guild_id)
     needed = ("mod_channel_id", "announce_channel_id", "voice_channel_id")
     missing = [k for k in needed if k not in conf]
@@ -765,7 +813,7 @@ async def movie(interaction: discord.Interaction,
         tz = ZoneInfo(CFG["default_timezone"])
     prefill_date, prefill_time = next_slot_prefill(interaction.guild_id, tz)
     await interaction.response.send_modal(
-        MovieModal(conf, show_type, make_vrchat, prefill_date, prefill_time))
+        MovieModal(conf, show_type, make_vrchat, prefill_date, prefill_time, image))
 
 
 @tree.command(name="movie-help",
@@ -786,7 +834,8 @@ async def movie_help(interaction: discord.Interaction):
                "the show and time of day (e.g. *Anime Matinée*). Set "
                "**vrchat:False** for a Discord-only watch party (skips the "
                "VRChat event even when linked). *Only works in the configured "
-               "mod channel.*\n"
+               "mod channel.* Use **image:** to attach a landscape backdrop "
+               "instead of looking it up on TMDB.\n"
                "**/movie-test** — dry-run that checks config & permissions "
                "without posting anything. Run this first.\n"
                "**/movie-cancel** — pick an upcoming movie night to delete its "
@@ -810,13 +859,21 @@ async def movie_help(interaction: discord.Interaction):
                "**unlink** — remove the VRChat link and stored session."),
         inline=False)
     embed.add_field(
+        name="Image credits",
+        value=("Backdrops: [TMDB](https://www.themoviedb.org).\n"
+               "This product uses the TMDB API but is not endorsed or certified by TMDB."),
+        inline=False)
+    embed.add_field(
         name="First-time setup",
         value=("1. `/movie-config set` your channels.\n"
                "2. *(optional)* `/movie-vrchat link` your VRChat group.\n"
                "3. `/movie-test` to confirm I have the access I need.\n"
                "4. `/movie` in the mod channel to schedule a night."),
         inline=False)
-    await interaction.response.send_message(embed=embed, ephemeral=True)
+    embed.set_thumbnail(url="attachment://tmdb-logo.png")
+    await interaction.response.send_message(
+        embed=embed, file=discord.File(HERE / "assets" / "tmdb-logo.png"),
+        ephemeral=True)
 
 
 @tree.command(name="movie-test",

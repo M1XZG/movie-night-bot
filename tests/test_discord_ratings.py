@@ -4,11 +4,13 @@ import unittest
 from unittest.mock import AsyncMock, Mock, patch
 
 import bot
+from find_backdrop import BackdropError
 from ratings import MovieRatings, RatingsError
 
 
 class DiscordRatingsTests(unittest.IsolatedAsyncioTestCase):
-    async def run_submission(self, *, lookup_error=False, announce_enabled=True, enriched=True):
+    async def run_submission(self, *, lookup_error=False, announce_enabled=True, enriched=True,
+                             backdrop_error=False, with_image=False, upload_error=False):
         voice = SimpleNamespace(id=11, mention="<#11>")
         announce = SimpleNamespace(id=12, mention="<#12>", send=AsyncMock(return_value=SimpleNamespace(id=99)))
         guild = SimpleNamespace(
@@ -23,7 +25,7 @@ class DiscordRatingsTests(unittest.IsolatedAsyncioTestCase):
         modal = SimpleNamespace(
             conf={"timezone": "UTC", "voice_channel_id": 11, "announce_channel_id": 12,
                   "announce_enabled": announce_enabled},
-            show_type="movie", make_vrchat=True,
+            show_type="movie", make_vrchat=True, image=None,
             date=SimpleNamespace(value="2099-01-07"), start=SimpleNamespace(value="19:00"),
             movie=SimpleNamespace(value="The Matrix"), year=SimpleNamespace(value="1999"),
             runtime=SimpleNamespace(value="136"),
@@ -38,7 +40,20 @@ class DiscordRatingsTests(unittest.IsolatedAsyncioTestCase):
         log = Mock()
         with ExitStack() as stack:
             stack.enter_context(patch.object(bot, "RATINGS_API_KEY", "testapikey"))
-            stack.enter_context(patch.object(bot, "fetch_backdrop", AsyncMock(return_value=None)))
+            image_path = Mock()
+            image_path.read_bytes.return_value = b"jpeg-image"
+            backdrop = AsyncMock(return_value=image_path if with_image else None)
+            if backdrop_error:
+                backdrop.side_effect = BackdropError("TMDB returned HTTP 401.")
+            elif not with_image:
+                backdrop.side_effect = BackdropError("TMDB has no suitable landscape backdrop.")
+            stack.enter_context(patch.object(bot, "fetch_backdrop", backdrop))
+            stack.enter_context(patch.object(bot.discord, "File"))
+            stack.enter_context(patch.object(bot, "_to_vrchat_png", return_value=b"png-image"))
+            upload = AsyncMock(return_value="file-test")
+            if upload_error:
+                upload.side_effect = bot.vrchat.VRChatAuthError("expired")
+            stack.enter_context(patch.object(bot.vrchat, "upload_image", upload))
             stack.enter_context(patch.object(bot, "enrich_with_copilot", AsyncMock(return_value=enrichment)))
             lookup = Mock(return_value=MovieRatings("8.7/10", "83%", "tt0133093"))
             if lookup_error:
@@ -88,6 +103,33 @@ class DiscordRatingsTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("83%", announce.send.await_args.kwargs["content"])
         self.assertNotIn("IMDb", vrc.await_args.args[2]["description"])
         self.assertNotIn("Rotten Tomatoes", vrc.await_args.args[2]["description"])
+
+    async def test_backdrop_failure_warns_mod_but_preserves_events(self):
+        guild, _, vrc, interaction, record, log, _ = await self.run_submission(backdrop_error=True)
+        self.assertNotIn("image", guild.create_scheduled_event.await_args.kwargs)
+        self.assertNotIn("imageId", vrc.await_args.args[2])
+        self.assertIn("No event image: TMDB returned HTTP 401.", interaction.followup.send.await_args.args[0])
+        self.assertTrue(any("backdrop unavailable" in call.args[0] for call in log.call_args_list))
+        record.assert_called_once()
+
+    async def test_same_image_reaches_discord_and_vrchat_and_is_recorded(self):
+        guild, _, vrc, interaction, record, _, _ = await self.run_submission(with_image=True)
+        self.assertEqual(guild.create_scheduled_event.await_args.kwargs["image"], b"jpeg-image")
+        self.assertEqual(vrc.await_args.args[2]["imageId"], "file-test")
+        saved = record.call_args.args[1]
+        self.assertEqual(saved["vrc_file_id"], "file-test")
+        self.assertEqual(saved["year"], "1999")
+        self.assertEqual(saved["show_type"], "movie")
+        self.assertNotIn("No event image", interaction.followup.send.await_args.args[0])
+
+    async def test_vrchat_upload_failure_warns_without_losing_discord_image(self):
+        guild, _, vrc, interaction, record, _, _ = await self.run_submission(
+            with_image=True, upload_error=True,
+        )
+        self.assertIn("image", guild.create_scheduled_event.await_args.kwargs)
+        self.assertNotIn("imageId", vrc.await_args.args[2])
+        self.assertIn("VRChat image upload failed: session expired.", interaction.followup.send.await_args.args[0])
+        self.assertNotIn("vrc_file_id", record.call_args.args[1])
 
 
 if __name__ == "__main__":
