@@ -75,6 +75,7 @@ class DiscordRatingsTests(unittest.IsolatedAsyncioTestCase):
                 next(i for i, call in enumerate(calls.mock_calls) if call[0] == "ratings"),
                 next(i for i, call in enumerate(calls.mock_calls) if call[0] == "backdrop"),
             )
+            self.assertEqual(lookup.call_args.kwargs["imdb_id"], imdb_id)
             expected_id = imdb_id or (None if lookup_error else ratings_id)
             self.assertEqual(backdrop.await_args.kwargs["imdb_id"], expected_id)
         return guild, announce, vrc_create, interaction, record, log, description

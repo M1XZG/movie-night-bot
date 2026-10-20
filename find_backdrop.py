@@ -137,13 +137,20 @@ def find_title(
             if not isinstance(results, list):
                 raise BackdropError("TMDB returned invalid IMDb lookup results.")
             for item in results:
-                identifier = _matching_id(item, titles, year, kind)
-                if identifier is not None:
-                    matches.add((kind, identifier))
+                if not isinstance(item, dict):
+                    raise BackdropError("TMDB returned an invalid title.")
+                identifier = item.get("id")
+                if (
+                    isinstance(identifier, bool)
+                    or not isinstance(identifier, int)
+                    or identifier <= 0
+                ):
+                    raise BackdropError("TMDB returned an invalid title identifier.")
+                matches.add((kind, identifier))
         if len(matches) == 1:
             return next(iter(matches))
         raise BackdropError(
-            "TMDB could not uniquely match this IMDb identifier to the requested title, year and type."
+            "TMDB could not uniquely match this IMDb identifier to the selected media type."
         )
     for search_title in titles:
         matches = {}
