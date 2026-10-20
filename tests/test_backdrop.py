@@ -233,14 +233,47 @@ class BackdropTests(unittest.TestCase):
         self.assertFalse(any("/search/" in call.args[0].full_url for call in get.call_args_list))
 
     @patch("find_backdrop.urlopen")
-    def test_imdb_match_must_agree_with_requested_title_year_and_type(self, get):
-        for item in ({**MOVIE, "title": "Wrong Title"}, {**MOVIE, "release_date": "2004-01-01"}):
-            get.return_value = response({"movie_results": [item], "tv_results": []})
-            with self.assertRaisesRegex(backdrop.BackdropError, "requested title, year and type"):
-                self.fetch(imdb_id="tt0327137")
+    def test_imdb_match_bypasses_title_and_year_but_respects_type(self, get):
+        get.side_effect = [
+            response({
+                "movie_results": [{
+                    **MOVIE,
+                    "title": "Provider Canonical Title",
+                    "release_date": "2004-01-01",
+                }],
+                "tv_results": [],
+            }),
+            response(IMAGES),
+            response(image()),
+        ]
+        self.fetch("User Supplied Alias Season 1", "2003", imdb_id="tt0327137")
+
+        get.reset_mock(side_effect=True)
         get.return_value = response({"movie_results": [], "tv_results": [MOVIE]})
-        with self.assertRaises(backdrop.BackdropError):
+        with self.assertRaisesRegex(backdrop.BackdropError, "selected media type"):
             self.fetch(imdb_id="tt0327137")
+
+    @patch("find_backdrop.urlopen")
+    def test_imdb_mapping_accepts_cyberpunk_season_label(self, get):
+        series = {
+            "id": 105248,
+            "name": "Cyberpunk: Edgerunners",
+            "first_air_date": "2022-09-13",
+        }
+        get.side_effect = [
+            response({"movie_results": [], "tv_results": [series]}),
+            response(IMAGES),
+            response(image()),
+        ]
+
+        self.fetch(
+            "Cyberpunk Edgerunners Season 1", None, "tv",
+            imdb_id="tt12590266")
+
+        self.assertEqual(
+            urlsplit(get.call_args_list[1].args[0].full_url).path,
+            "/3/tv/105248/images",
+        )
 
     @patch("find_backdrop.urlopen")
     def test_imdb_mapping_missing_or_multiple_does_not_fall_back_to_guessed_title(self, get):

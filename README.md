@@ -191,12 +191,14 @@ changes the entry name. Never commit a credential.
 The ratings lookup runs first. When it identifies an IMDb title, the bot uses
 that identifier to find the same movie or series on TMDB rather than searching
 again by name. This avoids confusing films that share both a title and a year.
-The TMDB result must still match the requested title, year and media type.
-That identity is also supplied to the text generator and saved in the event record.
+The TMDB result must still match the selected media type. That identity is also
+supplied to the text generator and saved in the event record.
 
 Use `/movie imdb:tt31349844` to pin a particular film or series explicitly.
-If the ratings provider returns a different IMDb identity, its scores are
-omitted with a warning rather than showing another film's ratings.
+The identifier becomes authoritative for ratings and backdrop lookup, so an
+event label such as a season name does not need to match the provider's
+canonical title. If a provider returns a different IMDb identity, its scores
+are omitted with a warning rather than showing another title's ratings.
 
 Without an IMDb identity, lookup requires one exact title/year match and checks
 up to five search pages. It uses the movie or TV catalogue appropriate to the

@@ -586,7 +586,8 @@ class MovieModal(discord.ui.Modal, title="Schedule a Watch Party"):
             ratings = await asyncio.to_thread(
                 fetch_ratings, title, yr, self.show_type,
                 api_key=RATINGS_API_KEY,
-                omdb_api_key=OMDB_API_KEY or None)
+                omdb_api_key=OMDB_API_KEY or None,
+                imdb_id=self.imdb_id)
             if self.imdb_id and ratings.imdb_id != self.imdb_id:
                 ratings = MovieRatings()
                 ratings_warning = "Ratings did not match the supplied IMDb identifier; scores omitted."

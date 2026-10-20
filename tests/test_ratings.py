@@ -239,6 +239,95 @@ class LookupTests(unittest.TestCase):
         )
 
     @patch("ratings.urlopen")
+    def test_explicit_imdb_id_bypasses_free_text_title_matching(self, get):
+        get.return_value = response({
+            "Response": "True",
+            "Title": "Cyberpunk: Edgerunners",
+            "Year": "2022–",
+            "Type": "series",
+            "imdbID": "tt12590266",
+            "imdbRating": "8.3",
+            "Ratings": [
+                {"Source": "Internet Movie Database", "Value": "8.3/10"},
+            ],
+        })
+
+        result = ratings.fetch_ratings(
+            "Cyberpunk Edgerunners Season 1", None, "tv",
+            api_key="mdblist-key", omdb_api_key="omdb-key",
+            imdb_id="tt12590266")
+
+        self.assertEqual(result.imdb, "8.3/10")
+        self.assertEqual(result.imdb_id, "tt12590266")
+        query = parse_qs(urlsplit(get.call_args.args[0].full_url).query)
+        self.assertEqual(query["i"], ["tt12590266"])
+        self.assertEqual(query["type"], ["series"])
+        self.assertNotIn("t", query)
+        self.assertNotIn("y", query)
+
+    @patch("ratings.urlopen")
+    def test_explicit_imdb_id_rejects_wrong_identity_or_media_type(self, get):
+        for changed in (
+            {"imdbID": "tt0000001"},
+            {"Type": "movie"},
+        ):
+            with self.subTest(changed=changed):
+                get.return_value = response({
+                    "Response": "True",
+                    "Title": "Cyberpunk: Edgerunners",
+                    "Year": "2022–",
+                    "Type": "series",
+                    "imdbID": "tt12590266",
+                    "imdbRating": "8.3",
+                    "Ratings": [],
+                    **changed,
+                })
+                with self.assertRaisesRegex(
+                    ratings.RatingsError, "IMDb identifier"
+                ):
+                    ratings.fetch_ratings(
+                        "Anything", None, "tv",
+                        api_key="mdblist-key", omdb_api_key="omdb-key",
+                        imdb_id="tt12590266")
+
+    @patch("ratings.urlopen")
+    def test_explicit_imdb_id_falls_back_to_direct_mdblist_lookup(self, get):
+        show = {
+            "title": "Cyberpunk: Edgerunners",
+            "year": 2022,
+            "type": "show",
+            "ids": {"imdb": "tt12590266", "mdblist": "test"},
+            "ratings": [{"source": "imdb", "value": 8.3}],
+        }
+        get.side_effect = [
+            response({
+                "Response": "True",
+                "Title": "Cyberpunk: Edgerunners",
+                "Year": "2022–",
+                "Type": "series",
+                "imdbID": "tt12590266",
+                "imdbRating": "N/A",
+                "Ratings": [],
+            }),
+            response(show),
+        ]
+
+        result = ratings.fetch_ratings(
+            "Cyberpunk Edgerunners Season 1", None, "tv",
+            api_key="mdblist-key", omdb_api_key="omdb-key",
+            imdb_id="tt12590266")
+
+        self.assertEqual(result.imdb, "8.3/10")
+        self.assertEqual(
+            urlsplit(get.call_args_list[1].args[0].full_url).path,
+            "/imdb/show/tt12590266",
+        )
+        self.assertFalse(any(
+            "/search/" in call.args[0].full_url
+            for call in get.call_args_list
+        ))
+
+    @patch("ratings.urlopen")
     def test_omdb_without_scores_falls_back_to_mdblist(self, get):
         series_search = {
             "search": [{
@@ -341,6 +430,9 @@ class LookupTests(unittest.TestCase):
             with self.subTest(title=title, year=year):
                 with self.assertRaises(ratings.RatingsError):
                     self.lookup(title, year)
+        with self.assertRaisesRegex(ratings.RatingsError, "IMDb identifier"):
+            ratings.fetch_ratings(
+                "The Matrix", "1999", imdb_id="../secrets")
         get.assert_not_called()
 
     @patch("ratings.load_api_key")

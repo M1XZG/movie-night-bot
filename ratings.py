@@ -25,6 +25,10 @@ class RatingsError(Exception):
     """A safe-to-display lookup failure; never contains a key or request URL."""
 
 
+class RatingsNotFoundError(RatingsError):
+    """Raised when a provider has no record for a valid lookup."""
+
+
 @dataclass(frozen=True)
 class MovieRatings:
     imdb: str | None = None
@@ -126,10 +130,11 @@ def _request(key: str, path: str, **params) -> dict:
         with urlopen(request, timeout=REQUEST_TIMEOUT) as response:
             raw = response.read(MAX_RESPONSE_BYTES + 1)
     except HTTPError as exc:
+        if exc.code == 404:
+            raise RatingsNotFoundError("MDBList could not find this title.") from None
         messages = {
             401: "The MDBList API key was rejected.",
             403: "MDBList denied this lookup.",
-            404: "MDBList could not find this title.",
             429: "The MDBList request limit was reached.",
         }
         raise RatingsError(messages.get(exc.code, f"MDBList returned HTTP {exc.code}.")) from None
@@ -150,15 +155,19 @@ def _request(key: str, path: str, **params) -> dict:
 
 def _omdb_request(
     key: str, title: str, year: str | None, show_type: str,
+    imdb_id: str | None = None,
 ) -> dict | None:
     params = {
         "apikey": key,
-        "t": title,
         "r": "json",
         "plot": "short",
     }
-    if year:
-        params["y"] = year
+    if imdb_id:
+        params["i"] = imdb_id
+    else:
+        params["t"] = title
+        if year:
+            params["y"] = year
     media_type = {"movie": "movie", "tv": "series"}.get(show_type)
     if media_type:
         params["type"] = media_type
@@ -277,7 +286,7 @@ def _rotten_url(value) -> str | None:
 
 def _fetch_mdblist_ratings(
     title: str, year: str | None = None, show_type: str = "movie",
-    *, api_key: str | None = None,
+    *, api_key: str | None = None, imdb_id: str | None = None,
 ) -> MovieRatings:
     """Resolve a title/year, refusing ambiguous or mismatched provider results."""
     title = title.strip()
@@ -285,7 +294,30 @@ def _fetch_mdblist_ratings(
         raise RatingsError("Enter a movie or series title to look up ratings.")
     if year is not None and not re.fullmatch(r"[0-9]{4}", year):
         raise RatingsError("Ratings lookup needs a four-digit release year.")
+    if imdb_id is not None and not IMDB_ID.fullmatch(imdb_id):
+        raise RatingsError("Use an IMDb identifier such as tt31349844.")
     key = load_api_key() if api_key is None else _validated_key(api_key)
+    if imdb_id:
+        kinds = {
+            "movie": ("movie",),
+            "tv": ("show",),
+            "anime": ("show", "movie"),
+        }.get(show_type, ("movie", "show"))
+        for current_kind in kinds:
+            try:
+                data = _request(key, f"/imdb/{current_kind}/{imdb_id}")
+            except RatingsNotFoundError:
+                continue
+            if (
+                data.get("type") != current_kind
+                or _identifier(data, "imdb") != imdb_id
+            ):
+                raise RatingsError(
+                    "MDBList returned a different or unverified IMDb identifier."
+                )
+            return _mdblist_scores(data)
+        raise RatingsError("MDBList could not find this IMDb identifier.")
+
     kind = {"movie": "movie", "tv": "show"}.get(show_type, "any")
     selected = None
     resolved_title = title
@@ -347,6 +379,10 @@ def _fetch_mdblist_ratings(
     ):
         raise RatingsError("MDBList returned a different or unverified title/year.")
 
+    return _mdblist_scores(data)
+
+
+def _mdblist_scores(data: dict) -> MovieRatings:
     entries = data.get("ratings", [])
     if not isinstance(entries, list):
         raise RatingsError("MDBList returned an invalid ratings list.")
@@ -375,10 +411,13 @@ def _fetch_omdb_ratings(
     year: str | None,
     show_type: str,
     api_key: str,
+    requested_imdb_id: str | None = None,
 ) -> MovieRatings | None:
     key = _validated_key(api_key, "OMDb")
-    for candidate in _search_titles(title, show_type):
-        data = _omdb_request(key, candidate, year, show_type)
+    candidates = [title] if requested_imdb_id else _search_titles(title, show_type)
+    for candidate in candidates:
+        data = _omdb_request(
+            key, candidate, year, show_type, requested_imdb_id)
         if data is None:
             continue
         returned_title = data.get("Title")
@@ -387,7 +426,16 @@ def _fetch_omdb_ratings(
         imdb_id = data.get("imdbID")
         year_match = re.match(r"([0-9]{4})", returned_year or "")
         expected_type = {"movie": "movie", "tv": "series"}.get(show_type)
-        if (
+        if requested_imdb_id:
+            if (
+                requested_imdb_id != imdb_id
+                or returned_type not in ("movie", "series")
+                or (expected_type is not None and returned_type != expected_type)
+            ):
+                raise RatingsError(
+                    "OMDb returned a different or unverified IMDb identifier."
+                )
+        elif (
             not isinstance(returned_title, str)
             or _normal_title(returned_title) != _normal_title(candidate)
             or not year_match
@@ -434,6 +482,7 @@ def fetch_ratings(
     *,
     api_key: str | None = None,
     omdb_api_key: str | None = None,
+    imdb_id: str | None = None,
 ) -> MovieRatings:
     """Prefer exact OMDb scores, then use MDBList when they are unavailable."""
     title = title.strip()
@@ -441,11 +490,14 @@ def fetch_ratings(
         raise RatingsError("Enter a movie or series title to look up ratings.")
     if year is not None and not re.fullmatch(r"[0-9]{4}", year):
         raise RatingsError("Ratings lookup needs a four-digit release year.")
+    if imdb_id is not None and not IMDB_ID.fullmatch(imdb_id):
+        raise RatingsError("Use an IMDb identifier such as tt31349844.")
 
     omdb_error = None
     if omdb_api_key:
         try:
-            omdb = _fetch_omdb_ratings(title, year, show_type, omdb_api_key)
+            omdb = _fetch_omdb_ratings(
+                title, year, show_type, omdb_api_key, imdb_id)
             if omdb is not None and (omdb.imdb is not None or omdb.rotten_tomatoes is not None):
                 return omdb
         except RatingsError as exc:
@@ -453,7 +505,7 @@ def fetch_ratings(
 
     try:
         return _fetch_mdblist_ratings(
-            title, year, show_type, api_key=api_key)
+            title, year, show_type, api_key=api_key, imdb_id=imdb_id)
     except RatingsError:
         if omdb_error is not None:
             raise omdb_error
