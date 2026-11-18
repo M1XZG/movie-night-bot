@@ -1,0 +1,11 @@
+[Unit]
+Description=Fetch VRChat group audit entries daily at midnight UTC
+
+[Timer]
+OnCalendar=*-*-* 00:00:00 UTC
+Persistent=true
+AccuracySec=1min
+Unit=vrchat-group-audit.service
+
+[Install]
+WantedBy=timers.target

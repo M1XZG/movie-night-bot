@@ -1,0 +1,12 @@
+{
+  "group_id": "grp_REPLACE",
+  "expected_user_id": "usr_REPLACE",
+  "vrchat_sessions_file": "/home/USER/.config/copilot-discord/movie-bot/vrchat.json",
+  "vrchat_guild_id": "REPLACE",
+  "discord_token_file": "/home/USER/.config/copilot-discord/bot/token",
+  "discord_guild_id": "REPLACE",
+  "category_id": "REPLACE",
+  "channel_name": "group-audit",
+  "webhook_file": "/home/USER/.config/vrchat-group-audit/webhook",
+  "database": "/home/USER/.local/share/vrchat-group-audit/audit.sqlite3"
+}

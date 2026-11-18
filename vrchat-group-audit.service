@@ -1,0 +1,12 @@
+[Unit]
+Description=Archive VRChat group audit entries to SQLite and Discord
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/.config/copilot-discord/movie-bot
+ExecStart=%h/.config/copilot-discord/bot/venv/bin/python -u %h/.config/copilot-discord/movie-bot/group_audit.py --config %h/.config/vrchat-group-audit/config.json
+UMask=0077
+NoNewPrivileges=true
+TimeoutStartSec=2h

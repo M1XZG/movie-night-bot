@@ -9,6 +9,54 @@ guild's announcements channel — both enriched with AI-generated content
 No `Administrator`. No privileged intents. Each server's mods configure their
 own channels, ping role and timezone.
 
+## Optional group audit archive
+
+`group_audit.py` runs independently of the movie bot. It reads the existing
+VRChat session on each run, fetches every audit entry the API still exposes,
+and stores complete records indefinitely in a private SQLite database.
+The first run posts one backfill summary. Later runs post new entries and a
+daily check summary through a Discord webhook, with mentions disabled.
+Large Discord fields are shortened; the SQLite record is not.
+
+Copy `group-audit.example.json` to a private configuration outside the checkout
+and replace its paths and IDs. The Discord bot must be in the destination
+server, be able to manage channels and webhooks during setup, and be able to
+view the audit channel and read its history afterward. The existing VRChat
+account needs permission to view the group's audit log.
+
+```bash
+python group_audit.py --config /private/path/config.json --setup
+python group_audit.py --config /private/path/config.json
+```
+
+Setup creates or reuses the configured channel under the supplied category,
+copying its permission overwrites. It refuses categories visible to
+`@everyone`. Webhook credentials are saved separately with mode 0600.
+Runtime delivery also verifies the destination and inherited private
+permissions. Only the configured group is fetched; VRChat is read-only.
+
+Install the supplied `vrchat-group-audit.service` and
+`vrchat-group-audit.timer` as user units after adapting their deployment paths.
+The timer runs at **00:00 UTC**, catches up after downtime, and does not
+restart or change the movie bot. The account must have user lingering enabled
+for unattended operation after logout.
+
+Each run fetches all currently available pages, using a fixed end time and
+the entry ID for deduplication. Failed deliveries remain in a durable SQLite
+outbox. Before retrying, the worker checks channel history for its message
+markers to recover sends whose responses were lost. A process lock prevents
+overlapping runs. Do not remove webhook message markers or the SQLite database
+if you need delivery deduplication.
+
+VRChat retention and permissions limit the initial backfill. This cannot
+recover entries that VRChat has already removed, and an outage longer than
+its retention window can leave an unrecoverable gap. Review service failures
+and the last daily Discord summary. Fetch failures generate a once-daily
+warning when Discord remains reachable; delivery/privacy failures remain in
+the service journal and outbox. Re-link expired sessions through the existing
+movie bot. Back up the SQLite database using SQLite's backup API, and keep
+the backup and configuration private.
+
 ---
 
 ## Features

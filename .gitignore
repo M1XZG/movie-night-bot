@@ -8,6 +8,9 @@ guilds.json
 events.json
 vrchat.json
 bot.log
+group-audit.json
+*.sqlite3
+*.sqlite3-*
 
 # Scratch
 tmp/
