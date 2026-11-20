@@ -13,7 +13,7 @@ own channels, ping role and timezone.
 
 ## Features
 
-- **`/movie`** — opens a form (title / year / date / time / runtime), then:
+- **`/movie schedule`** — opens a form (title / year / date / time / runtime), then:
   - creates a Discord scheduled event (with a 16:9 backdrop image when found), and
   - posts a styled announcement, optionally pinging a configurable role.
   - The **date and time fields are pre-filled** one week after this server's latest
@@ -29,7 +29,16 @@ own channels, ping role and timezone.
     `vrchat:False` for a Discord-only watch party that skips the VRChat event.
 - **`/movie-test`** — dry-run that verifies config and all required permissions
   (Manage Events, channel visibility, send/embed/attach, ping role) **without**
-  posting anything. Run this before the first real `/movie`.
+  posting anything. Run this before the first real `/movie schedule`.
+- **`/movie unfuck`** — in the mod channel, pick a bot-managed upcoming booking
+  by title and local date, then describe a wrong film or artwork problem. Give
+  the intended title/year or IMDb ID when the saved movie is wrong. Pick a TMDB
+  match, browse available covers (or attach your own with `image:`), and review
+  the private preview. Only **Apply repair** edits the existing event, linked
+  VRChat event and existing bot announcement. Artwork-only repairs leave text
+  alone. Identity repairs replace the film details and Discord ratings but never
+  move the booking. No fresh announcements, role pings or calendar events are
+  created. After a partial failure, retry just the unfinished steps.
 - **`/movie-cancel`** — autocompletes this server's upcoming movie nights and
   deletes **both** the scheduled event and the announcement message.
 - **`/movie-help`** — posts an ephemeral guide listing every command and what it does.
@@ -56,7 +65,7 @@ own channels, ping role and timezone.
 
 ```mermaid
 flowchart TD
-    A[Mod runs /movie in mod channel] --> B[Modal: title, year, date, time, runtime]
+    A[Mod runs /movie schedule in mod channel] --> B[Modal: title, year, date, time, runtime]
     B --> C[find_backdrop.py → TMDB API / validated image cache]
     B --> D[copilot -p --silent → JSON: announcement + event blurb]
     C --> E[create_scheduled_event in voice channel]
@@ -194,7 +203,7 @@ again by name. This avoids confusing films that share both a title and a year.
 The TMDB result must still match the selected media type. That identity is also
 supplied to the text generator and saved in the event record.
 
-Use `/movie imdb:tt31349844` to pin a particular film or series explicitly.
+Use `/movie schedule imdb:tt31349844` to pin a particular film or series explicitly.
 The identifier becomes authoritative for ratings and backdrop lookup, so an
 event label such as a season name does not need to match the provider's
 canonical title. If a provider returns a different IMDb identity, its scores
@@ -213,7 +222,7 @@ or under `MOVIE_BOT_TMP/backdrops/`. Valid cached images work without an
 API request or credential. Invalid cached files are reported and refreshed.
 To fetch a newer image for a title, remove its individual cached JPEG.
 
-Use `/movie image:` to attach your own landscape JPEG, PNG or WebP
+Use `/movie schedule image:` to attach your own landscape JPEG, PNG or WebP
 (under 8 MB, at least 320 x 180) before opening the schedule form.
 This bypasses TMDB and uses the same validation and uploads for both platforms.
 If an image cannot be acquired, scheduling still works, but the mod receives
@@ -297,10 +306,10 @@ still required either way, so it's ready when you re-enable it.
 Now schedule one (must be run in the configured mod channel):
 
 ```
-/movie                       # defaults to a Movie
-/movie type:🌸 Anime         # wording becomes Anime Night / Anime Matinée / …
-/movie type:📺 TV Series     # Series Night / Series Matinée / Morning Binge
-/movie vrchat:False          # Discord-only — skip the VRChat event this time
+/movie schedule                       # defaults to a Movie
+/movie schedule type:🌸 Anime         # wording becomes Anime Night / Anime Matinée / …
+/movie schedule type:📺 TV Series     # Series Night / Series Matinée / Morning Binge
+/movie schedule vrchat:False          # Discord-only — skip the VRChat event this time
 ```
 
 …and cancel if needed:
@@ -313,7 +322,7 @@ Now schedule one (must be run in the configured mod channel):
 
 | Option | Notes |
 | --- | --- |
-| `mod_channel` | only channel where `/movie` and `/movie-cancel` work |
+| `mod_channel` | channel for scheduling, repairing and cancelling bookings |
 | `announce_channel` | where announcements are posted |
 | `voice_channel` | the scheduled event's voice channel |
 | `ping_role` | optional role to ping at the top (use `@everyone` for everyone) |
@@ -333,7 +342,7 @@ Now schedule one (must be run in the configured mod channel):
 ## Security notes
 
 - Slash commands are gated with `default_permissions(manage_events=True)` and
-  `guild_only()`; `/movie` and `/movie-cancel` are additionally restricted to
+  `guild_only()`; `/movie schedule` and `/movie-cancel` are additionally restricted to
   the configured mod channel.
 - The bot requests **no privileged intents** and uses `Intents.none()` +
   `guilds`. It never reads message content.
@@ -379,10 +388,10 @@ flowchart TD
 | `/movie-vrchat early-start` | start the VRChat event N minutes early (end time unchanged) |
 | `/movie-vrchat unlink` | delete the stored session and group link |
 
-Once linked, every `/movie` also creates a VRChat group calendar event
+Once linked, every `/movie schedule` also creates a VRChat group calendar event
 (`POST /calendar/{groupId}/event`) using the movie's title, AI synopsis, and
 start/end times; `/movie-cancel` deletes it (`DELETE /calendar/{groupId}/{calendarId}`).
-Pass `vrchat:False` on `/movie` to skip the VRChat event for a single
+Pass `vrchat:False` on `/movie schedule` to skip the VRChat event for a single
 Discord-only watch party.
 
 Events are explicitly published with `isDraft:false` and target Windows,
@@ -417,7 +426,7 @@ group banner. (Requires `Pillow` — see `requirements.txt`.)
   that account's gallery/files) and are removed on `/movie-cancel`.
 - The VRChat API is **unofficial**. The bot sends a descriptive `User-Agent`
   and makes only occasional calls; respect VRChat's rate limits and Terms.
-- Session cookies expire eventually — when they do, `/movie` and
+- Session cookies expire eventually — when they do, `/movie schedule` and
   `/movie-vrchat status` will say so; just run `/movie-vrchat link` again.
 - Discord modals don't mask the password field as you type, and the value
   transits Discord's interaction payload to the bot. Only link an account you

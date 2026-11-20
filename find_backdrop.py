@@ -164,7 +164,7 @@ def find_title(
                 raise BackdropError("TMDB returned an invalid search page count.")
             if pages > MAX_SEARCH_PAGES:
                 raise BackdropError(
-                    "TMDB returned too many candidates; use `/movie imdb:` or a manual backdrop."
+                    "TMDB returned too many candidates; use `/movie schedule imdb:` or a manual backdrop."
                 )
             for page in range(1, max(pages, 1) + 1):
                 if page > 1:
@@ -180,7 +180,7 @@ def find_title(
             return next(iter(matches))
         if matches:
             raise BackdropError(
-                "Multiple TMDB films/shows match this title and year; use `/movie imdb:` or a manual backdrop."
+                "Multiple TMDB films/shows match this title and year; use `/movie schedule imdb:` or a manual backdrop."
             )
     raise BackdropError("No exact title/year match was found on TMDB; use a manual backdrop.")
 
@@ -227,6 +227,54 @@ def _backdrop_paths(kind: str, identifier: int, credential: Credential) -> list[
     if not paths:
         raise BackdropError("TMDB has no suitable landscape backdrop for this title.")
     return paths
+
+
+def repair_candidates(query: str, year: str | None, show_type: str) -> list[tuple[str, int, str]]:
+    """Offer choices rather than treating the first fuzzy search result as authoritative."""
+    credential = load_credential()
+    kinds = {"movie": ("movie",), "tv": ("tv",)}.get(show_type, ("tv", "movie"))
+    choices = []
+    for kind in kinds:
+        if IMDB_ID.fullmatch(query):
+            data = _request(credential, f"/find/{query}", external_source="imdb_id")
+            rows = data.get(f"{kind}_results", [])
+        else:
+            params = {"query": query, "include_adult": "false"}
+            if year:
+                params["year" if kind == "movie" else "first_air_date_year"] = year
+            rows = _request(credential, f"/search/{kind}", **params).get("results", [])
+        for item in rows[:8]:
+            key = item.get("id")
+            name = item.get("title" if kind == "movie" else "name")
+            date = item.get("release_date" if kind == "movie" else "first_air_date") or ""
+            if type(key) is int and key > 0 and name and (not year or date[:4] == year):
+                choices.append((kind, key, f"{name} ({date[:4] or '?'}, {kind})"))
+    return choices
+
+
+def repair_details(kind: str, identifier: int) -> dict:
+    data = _request(load_credential(), f"/{kind}/{identifier}", append_to_response="credits,external_ids")
+    if data.get("id") != identifier:
+        raise BackdropError("TMDB did not confirm the selected title.")
+    cast = data.get("credits", {}).get("cast", [])
+    crew = data.get("credits", {}).get("crew", [])
+    return dict(title=data.get("title") or data["name"],
+                year=(data.get("release_date") or data.get("first_air_date") or "")[:4],
+                imdb_id=data.get("external_ids", {}).get("imdb_id"),
+                overview=data.get("overview") or "", runtime=data.get("runtime"),
+                people=", ".join([p["name"] for p in crew if p.get("job") == "Director"][:1]
+                                 + [p["name"] for p in cast[:3]]))
+
+
+def repair_artwork(kind: str, identifier: int) -> list[str]:
+    return _backdrop_paths(kind, identifier, load_credential())[:3]
+
+
+def repair_cover(path: str) -> bytes:
+    if not IMAGE_PATH.fullmatch(path):
+        raise BackdropError("TMDB returned an invalid image path.")
+    return validated_image(_read(Request(IMAGE_BASE + path, headers={"User-Agent": "MovieNightBot/1.0"}),
+                                 MAX_IMAGE_BYTES, provider="TMDB image CDN"))
 
 
 def validated_image(data: bytes) -> bytes:

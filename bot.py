@@ -10,7 +10,7 @@ channel.
 Slash commands (all guild-only, gated to mods via default_member_permissions =
 Manage Events):
 
-  /movie                Opens a form (title / year / date / time / runtime),
+  /movie schedule                Opens a form (title / year / date / time / runtime),
                         then creates the event + posts the announcement.
                         Only works in the guild's configured mod channel.
   /movie-cancel         Autocompletes upcoming movie nights; deletes the
@@ -40,6 +40,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -48,6 +49,7 @@ import discord
 from discord import app_commands
 
 import vrchat
+from movie_repair import Picker, RepairSession, RepairShortcut
 from find_backdrop import BackdropError, MAX_IMAGE_BYTES, manual_backdrop
 from ratings import (
     IMDB_ID, MovieRatings, RatingsError, discord_announcement,
@@ -118,11 +120,21 @@ EVENTS = load_json(EVENTS_FILE, {})
 VRC = load_json(VRC_FILE, {})
 
 
-def save_events() -> None:
+def save_events(*, strict=False) -> None:
+    temp = None
     try:
-        EVENTS_FILE.write_text(json.dumps(EVENTS, indent=2) + "\n")
+        with tempfile.NamedTemporaryFile(mode="w", dir=EVENTS_FILE.parent, delete=False) as f:
+            temp = Path(f.name)
+            json.dump(EVENTS, f, indent=2)
+            f.write("\n")
+        temp.replace(EVENTS_FILE)
     except OSError as e:
         log(f"WARN: could not write events.json: {e}")
+        if strict:
+            raise
+    finally:
+        if temp:
+            temp.unlink(missing_ok=True)
 
 
 def add_event_record(guild_id: int, rec: dict) -> None:
@@ -256,14 +268,14 @@ async def fetch_backdrop(title: str, year: str | None,
             if reasons:
                 raise BackdropError(reasons[-1][:500])
             raise BackdropError(
-                "TMDB backdrop lookup failed. Check bot.log or supply an image with `/movie image:`."
+                "TMDB backdrop lookup failed. Check bot.log or supply an image with `/movie schedule image:`."
             )
         path = (out or b"").decode().strip().splitlines()[-1] if out else "NONE"
         if path and path != "NONE" and Path(path).exists():
             return Path(path)
         raise BackdropError("The backdrop lookup did not produce an image.")
     except asyncio.TimeoutError:
-        raise BackdropError("The backdrop lookup timed out; supply an image with `/movie image:`.") from None
+        raise BackdropError("The backdrop lookup timed out; supply an image with `/movie schedule image:`.") from None
     except (OSError, IndexError, UnicodeError):
         raise BackdropError("The backdrop lookup could not be run; check bot.log.") from None
     finally:
@@ -791,15 +803,17 @@ class MovieModal(discord.ui.Modal, title="Schedule a Watch Party"):
         await interaction.followup.send(
             f"✅ Scheduled **{title}** for <t:{unix}:F>, created the event"
             f"{announce_note}.\n{event_url}{vrc_note}{ratings_note}{image_note}",
-            ephemeral=True)
-        log(f"/movie by {interaction.user} in guild {guild.id}: "
+            ephemeral=True, view=RepairShortcut(RepairSession(sys.modules[__name__], interaction, None), event.id))
+        log(f"/movie schedule by {interaction.user} in guild {guild.id}: "
             f"'{title}' @ {start_dt.isoformat()} event={event.id}")
 
 
-@tree.command(name="movie",
-              description="Schedule a watch party (creates an event + announcement).")
-@app_commands.guild_only()
-@app_commands.default_permissions(manage_events=True)
+movie_group = app_commands.Group(
+    name="movie", description="Schedule or repair this server's movie nights.",
+    guild_only=True, default_permissions=discord.Permissions(manage_events=True))
+
+
+@movie_group.command(name="schedule", description="Schedule a watch party (creates an event + announcement).")
 @app_commands.describe(
     type="What you're showing — adapts the wording (default: Movie).",
     vrchat="Also create a VRChat group event? (default: yes when linked).",
@@ -836,7 +850,7 @@ async def movie(interaction: discord.Interaction,
         ch = interaction.guild.get_channel(conf["mod_channel_id"])
         where = ch.mention if ch else "the configured mod channel"
         await interaction.response.send_message(
-            f"⚠️ `/movie` can only be used in {where}.", ephemeral=True)
+            f"⚠️ `/movie schedule` can only be used in {where}.", ephemeral=True)
         return
     show_type = type.value if type else "movie"
     make_vrchat = True if vrchat is None else vrchat
@@ -848,6 +862,20 @@ async def movie(interaction: discord.Interaction,
     prefill_date, prefill_time = next_slot_prefill(interaction.guild_id, tz)
     await interaction.response.send_modal(
         MovieModal(conf, show_type, make_vrchat, prefill_date, prefill_time, image, imdb))
+
+
+@movie_group.command(name="unfuck", description="Pick a movie night and repair its film details or artwork.")
+@app_commands.describe(image="Optional replacement landscape cover (JPEG/PNG/WebP under 8 MB).")
+async def movie_unfuck(interaction: discord.Interaction, image: discord.Attachment | None = None):
+    session = RepairSession(sys.modules[__name__], interaction, image)
+    if not await session.allowed(interaction):
+        return
+    if not session.records():
+        return await interaction.response.send_message("No upcoming Movie Bot bookings in this server.", ephemeral=True)
+    await interaction.response.send_message("Which movie night needs fixing?", view=Picker(session), ephemeral=True)
+
+
+tree.add_command(movie_group)
 
 
 @tree.command(name="movie-help",
@@ -862,7 +890,7 @@ async def movie_help(interaction: discord.Interaction):
         color=0x5865F2)
     embed.add_field(
         name="Scheduling",
-        value=("**/movie** — open a form (title, year, date, time, runtime) to "
+        value=("**/movie schedule** — open a form (title, year, date, time, runtime) to "
                "create a scheduled event + announcement. Pick a **type** "
                "(Movie / TV Series / Anime / Other) and the wording adapts to "
                "the show and time of day (e.g. *Anime Matinée*). Set "
@@ -876,6 +904,11 @@ async def movie_help(interaction: discord.Interaction):
                "**/movie-cancel** — pick an upcoming movie night to delete its "
                "event **and** announcement (and the VRChat event if linked).\n"
                "**/movie-help** — show this guide."),
+        inline=False)
+    embed.add_field(
+        name="Repairs",
+        value="**/movie unfuck** — pick an upcoming booking, describe the problem and preview a repair. "
+              "Use **image:** for a custom cover. Nothing is changed until you press **Apply repair**.",
         inline=False)
     embed.add_field(
         name="Configuration  ·  /movie-config",
@@ -903,7 +936,7 @@ async def movie_help(interaction: discord.Interaction):
         value=("1. `/movie-config set` your channels.\n"
                "2. *(optional)* `/movie-vrchat link` your VRChat group.\n"
                "3. `/movie-test` to confirm I have the access I need.\n"
-               "4. `/movie` in the mod channel to schedule a night."),
+               "4. `/movie schedule` in the mod channel to schedule a night."),
         inline=False)
     embed.set_thumbnail(url="attachment://tmdb-logo.png")
     await interaction.response.send_message(
@@ -956,7 +989,7 @@ async def movie_test(interaction: discord.Interaction):
     announce_on = conf.get("announce_enabled", True)
     announce = guild.get_channel(conf["announce_channel_id"])
     if not announce_on:
-        lines.append("ℹ️ Announcements are **off** — `/movie` will create the "
+        lines.append("ℹ️ Announcements are **off** — `/movie schedule` will create the "
                      "event (and VRChat event) but won't post a message.")
     if announce is None:
         lines.append(mark(False, "Announcements channel not found (re-run `/movie-config set`)."))
@@ -993,7 +1026,7 @@ async def movie_test(interaction: discord.Interaction):
                              else "missing " + ", ".join(vbad)
                              + " (Discord needs both to schedule a voice event).")))
 
-    # 5. Mod channel — view (where /movie is used)
+    # 5. Mod channel — view (where /movie schedule is used)
     mod = guild.get_channel(conf["mod_channel_id"])
     if mod is None:
         lines.append(mark(False, "Mod channel not found (re-run `/movie-config set`)."))
@@ -1029,7 +1062,7 @@ async def movie_test(interaction: discord.Interaction):
 
     title = "🎬 Movie Night — setup test"
     if ok_all:
-        lines.append("\n**All required checks passed — you're ready to run `/movie`.** 🎉")
+        lines.append("\n**All required checks passed — you're ready to run `/movie schedule`.** 🎉")
         color = 0x57F287
     else:
         lines.append("\n**Some checks failed.** Fix the ❌ items above, then run `/movie-test` again.")
@@ -1154,7 +1187,7 @@ config_group = app_commands.Group(
 
 @config_group.command(name="set", description="Set this server's channels, timezone and options.")
 @app_commands.describe(
-    mod_channel="Channel where mods may run /movie",
+    mod_channel="Channel where mods may run /movie schedule",
     announce_channel="Channel where announcements are posted",
     voice_channel="Voice channel the movie event points to",
     ping_role="Role to @mention with each announcement (optional)",

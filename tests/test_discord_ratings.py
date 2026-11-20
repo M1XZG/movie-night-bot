@@ -19,7 +19,7 @@ class DiscordRatingsTests(unittest.IsolatedAsyncioTestCase):
             create_scheduled_event=AsyncMock(return_value=SimpleNamespace(id=100)),
         )
         interaction = SimpleNamespace(
-            guild=guild, user="test-user",
+            guild=guild, guild_id=guild.id, user=SimpleNamespace(id=17),
             response=SimpleNamespace(defer=AsyncMock()),
             followup=SimpleNamespace(send=AsyncMock()),
         )
