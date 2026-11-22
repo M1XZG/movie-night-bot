@@ -3,8 +3,8 @@
 A focused, **least-privilege** Discord bot that lets server mods schedule movie
 nights. For each one it creates a native Discord **scheduled event** in the
 guild's movie voice channel and posts a whimsical **announcement** in the
-guild's announcements channel — both enriched with AI-generated content
-(synopsis, cast, director, fun facts).
+guild's announcements channel. Film facts come from verified TMDB metadata;
+optional AI copy adds a generic invitation.
 
 No `Administrator`. No privileged intents. Each server's mods configure their
 own channels, ping role and timezone.
@@ -44,13 +44,15 @@ own channels, ping role and timezone.
 - **`/movie-help`** — posts an ephemeral guide listing every command and what it does.
 - **`/movie-config set | show | clear`** — per-guild configuration.
 - **AI content** via the [GitHub Copilot CLI](https://github.com/github/copilot-cli):
-  the bot shells out to `copilot -p ... --silent` to write the announcement and
-  a synopsis + fun facts for the event. Falls back to a plain template if
-  Copilot isn't available (toggle with `use_copilot` in `config.json`).
+  optional generic invitation copy, with no tool use or film research. The
+  synopsis and people come from verified TMDB metadata. A failed lookup uses
+  a plain template instead of invented facts; unavailable AI does not discard
+  verified metadata. `use_copilot` controls the optional invitation.
 - **Independent ratings:** OMDb is queried first for exact IMDb and Rotten
   Tomatoes scores, with MDBList as a fallback when OMDb has no usable ratings.
   Anime/TV labels ending in `episode 10`, `ep. 10` or `S1E10` can safely fall
-  back to the exact parent-series title; movies are never rewritten.
+  back to the exact parent-series title. Movies use exact titles except for
+  the documented, verified Gremlins 2 alias.
 - **IMDb and Rotten Tomatoes ratings** from MDBList appear below Runtime in
   Discord announcements and in the Discord event description. Rotten Tomatoes
   means the critics' score, not the audience score. These scores are fetched
@@ -66,14 +68,15 @@ own channels, ping role and timezone.
 ```mermaid
 flowchart TD
     A[Mod runs /movie schedule in mod channel] --> B[Modal: title, year, date, time, runtime]
-    B --> C[find_backdrop.py → TMDB API / validated image cache]
-    B --> D[copilot -p --silent → JSON: announcement + event blurb]
-    C --> E[create_scheduled_event in voice channel]
-    D --> E
-    D --> F[post announcement in announce channel]
-    E --> G[(events.json: event_id, message_id, …)]
-    F --> G
-    G -.-> H[/movie-cancel deletes event + message/]
+    B --> R[Resolve ratings and identity]
+    R --> C[Validate artwork and independent TMDB identity]
+    C --> D[Verified facts + optional generic AI invitation]
+    D --> E[Create Discord scheduled event]
+    E --> G[Persist Discord success and pending platform work]
+    G --> F[Send announcement if enabled; persist outcome]
+    F --> V[Save VRChat baseline and artwork; create once]
+    V --> S[Persist confirmed or uncertain VRChat outcome]
+    S -.-> H[Recover unfinished work or retry cancellation]
 ```
 
 Per-guild state lives in JSON files next to `bot.py`:
@@ -126,7 +129,7 @@ Gateway intents: **guilds only** (no Message Content / Members / Presence).
 
 ## Install
 
-Requires **Python 3.11+** (uses `zoneinfo`) and, for AI content, the
+Requires **Python 3.10+** (CI covers 3.10 and 3.11) and, for AI content, the
 **GitHub Copilot CLI** on the host.
 
 ```bash
@@ -200,8 +203,10 @@ changes the entry name. Never commit a credential.
 The ratings lookup runs first. When it identifies an IMDb title, the bot uses
 that identifier to find the same movie or series on TMDB rather than searching
 again by name. This avoids confusing films that share both a title and a year.
-The TMDB result must still match the selected media type. That identity is also
-supplied to the text generator and saved in the event record.
+The TMDB result must still match the selected media type. An identifier inferred
+from ratings must independently match the original requested title and year.
+An identity mismatch discards the inferred identifier and scores rather than
+letting them identify the wrong film in generated copy.
 
 Use `/movie schedule imdb:tt31349844` to pin a particular film or series explicitly.
 The identifier becomes authoritative for ratings and backdrop lookup, so an
@@ -214,12 +219,18 @@ up to five search pages. It uses the movie or TV catalogue appropriate to the
 chosen type and supports parent-series lookup for TV/anime episode titles.
 Ambiguous matches are reported instead of selecting the first film. Supply
 the release year for remakes; title and year alone can still be ambiguous.
+The verified abbreviation Gremlins 2 resolves to Gremlins 2: The New Batch
+(1990). Unknown aliases are not guessed; select the canonical title or provide
+an explicit IMDb identifier.
 
 Backdrops are fully decoded and converted to 1280 x 720 JPEGs before being
 used on Discord and converted to PNG for VRChat. Successful lookups are
-cached by title, year, show type and available IMDb identity under `tmp/backdrops/` next to the bot,
-or under `MOVIE_BOT_TMP/backdrops/`. Valid cached images work without an
-API request or credential. Invalid cached files are reported and refreshed.
+cached by title, year, show type and IMDb identity provenance under `tmp/backdrops/` next to the bot,
+or under `MOVIE_BOT_TMP/backdrops/`. Versioned manifests verify the selected
+identity, image digest and a 30-day age limit. Valid images within that limit
+work without an API request or credential. Invalid, expired or legacy cache
+entries are refreshed; immutable image files prevent concurrent writers from
+mixing cache metadata and artwork.
 To fetch a newer image for a title, remove its individual cached JPEG.
 
 Use `/movie schedule image:` to attach your own landscape JPEG, PNG or WebP
@@ -333,8 +344,8 @@ Now schedule one (must be run in the configured mod channel):
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `default_timezone` | `Europe/London` | fallback tz |
-| `use_copilot` | `true` | enable AI content via the Copilot CLI |
-| `copilot_timeout` | `120` | seconds to wait for Copilot |
+| `use_copilot` | `true` | enable the optional generic AI invitation |
+| `copilot_timeout` | `90` | seconds to wait for Copilot |
 | `default_runtime_minutes` | `120` | event length when runtime omitted |
 
 ---
@@ -386,10 +397,11 @@ flowchart TD
 | `/movie-vrchat link` | start the credential + 2FA flow (one-time per server) |
 | `/movie-vrchat status` | show the linked account/group and check if the session is still valid |
 | `/movie-vrchat early-start` | start the VRChat event N minutes early (end time unchanged) |
+| `/movie-vrchat recover` | reconcile or resume a saved unfinished calendar booking after re-linking |
 | `/movie-vrchat unlink` | delete the stored session and group link |
 
 Once linked, every `/movie schedule` also creates a VRChat group calendar event
-(`POST /calendar/{groupId}/event`) using the movie's title, AI synopsis, and
+(`POST /calendar/{groupId}/event`) using the movie's title, verified synopsis, and
 start/end times; `/movie-cancel` deletes it (`DELETE /calendar/{groupId}/{calendarId}`).
 Pass `vrchat:False` on `/movie schedule` to skip the VRChat event for a single
 Discord-only watch party.
@@ -426,11 +438,55 @@ group banner. (Requires `Pillow` — see `requirements.txt`.)
   that account's gallery/files) and are removed on `/movie-cancel`.
 - The VRChat API is **unofficial**. The bot sends a descriptive `User-Agent`
   and makes only occasional calls; respect VRChat's rate limits and Terms.
-- Session cookies expire eventually — when they do, `/movie schedule` and
-  `/movie-vrchat status` will say so; just run `/movie-vrchat link` again.
+- Session cookies expire eventually. Refresh the link, then explicitly recover
+  an unfinished booking. Re-linking alone does not backfill calendar events.
 - Discord modals don't mask the password field as you type, and the value
   transits Discord's interaction payload to the bot. Only link an account you
   control, on a bot host you trust. The bot stores **only** the session token.
+
+---
+
+## Failure recovery
+
+The bot saves the Discord event before attempting the announcement or VRChat
+work. Each confirmed side effect is checkpointed. A state-file failure stops
+further writes, and corrupt booking state prevents startup rather than silently
+discarding the cancellation index.
+
+To recover a new booking missed during expired VRChat authentication, refresh
+the link and select the saved booking:
+
+```text
+/movie-vrchat link
+/movie-vrchat recover
+```
+
+Recovery reconciles an uncertain POST before doing anything else. It never
+blindly creates another calendar event. Older bookings without a saved creation
+payload still require reviewed manual backfill.
+
+Repairs retain their selected identity, preview and uploaded image ID across
+restarts. Reopen the repair picker to resume only unfinished targets:
+
+```text
+/movie unfuck
+```
+
+For inconsistent film text with correct covers, describe the problem as
+`text only` and supply the intended IMDb identifier. The private preview keeps
+existing artwork and booking times. Applying it sends no new announcements or
+creation notifications.
+
+Failed cancellations retain the booking and completed deletion steps. Retry
+cancellation instead of scheduling or repairing the same booking. VRChat
+artwork is deleted only after its calendar event is confirmed gone.
+
+Generic request-duration logs and typed VRChat stage failures make future
+problems distinguishable without logging credentials or response bodies.
+Ambiguous Discord sends need manual reconciliation. An image upload accepted
+without a returned file ID cannot be reliably located automatically. Conflicting
+calendar matches also require review; the bot preserves uncertain state rather
+than claiming success or blindly repeating the operation.
 
 ---
 

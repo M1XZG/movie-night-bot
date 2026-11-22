@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import hashlib
 import io
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -19,7 +20,10 @@ from urllib.request import Request, urlopen
 
 from PIL import Image, ImageOps, UnidentifiedImageError
 
-from ratings import IMDB_ID, _normal_title, _search_titles
+from ratings import (
+    IMDB_ID, _lookup_deadline, _normal_title, _read_response, _remaining_timeout, _retry_delay,
+    _search_titles, _wait_for_retry,
+)
 
 API = "https://api.themoviedb.org/3"
 IMAGE_BASE = "https://image.tmdb.org/t/p/w1280"
@@ -28,11 +32,19 @@ MAX_JSON_BYTES = 1_000_000
 MAX_IMAGE_BYTES = 8_000_000
 TIMEOUT = 8
 MAX_SEARCH_PAGES = 5
+LOOKUP_TIMEOUT = 50
+MAX_IMAGE_CANDIDATES = 5
+CACHE_VERSION = 2
+CACHE_MAX_AGE = 30 * 24 * 60 * 60
 IMAGE_PATH = re.compile(r"/[A-Za-z0-9_-]+\.(?:jpg|png)\Z")
 
 
 class BackdropError(Exception):
     """A safe-to-display image failure, without credentials or request URLs."""
+
+
+class BackdropIdentityError(BackdropError):
+    """A ratings-inferred identity failed the independent TMDB check."""
 
 
 @dataclass(frozen=True)
@@ -86,19 +98,25 @@ def _credential(value: str, bearer: bool) -> Credential:
 def _read(request: Request, limit: int, *, provider: str) -> bytes:
     for attempt in range(2):
         try:
-            with urlopen(request, timeout=TIMEOUT) as response:
-                data = response.read(limit + 1)
+            with urlopen(request, timeout=_remaining_timeout(TIMEOUT)) as response:
+                data = _read_response(response, limit, TIMEOUT)
             if len(data) > limit:
                 raise BackdropError(f"{provider} returned an oversized response.")
             return data
         except HTTPError as exc:
             retryable = exc.code == 429 or 500 <= exc.code < 600
+            code, delay = exc.code, _retry_delay(exc)
+            exc.close()
             if not retryable or attempt:
-                raise BackdropError(f"{provider} returned HTTP {exc.code}.") from None
+                raise BackdropError(f"{provider} returned HTTP {code}.") from None
         except (URLError, TimeoutError, OSError):
+            delay = 0.5
             if attempt:
                 raise BackdropError(f"{provider} could not be reached.") from None
-        time.sleep(0.5)
+        try:
+            _wait_for_retry(delay, LOOKUP_TIMEOUT)
+        except TimeoutError:
+            raise BackdropError(f"{provider} lookup timed out.") from None
     raise BackdropError(f"{provider} could not be reached.")
 
 
@@ -123,10 +141,11 @@ def _request(credential: Credential, path: str, **params) -> dict:
 
 def find_title(
     title: str, year: str | None, show_type: str, credential: Credential,
-    imdb_id: str | None = None,
+    imdb_id: str | None = None, *, imdb_id_explicit: bool = True,
 ) -> tuple[str, int]:
+    _validate_lookup(title, year, show_type, imdb_id)
     kinds = {"movie": ("movie",), "tv": ("tv",)}.get(show_type, ("tv", "movie"))
-    titles = _search_titles(title, show_type)
+    titles = _search_titles(title, show_type, year)
     if imdb_id:
         if not IMDB_ID.fullmatch(imdb_id):
             raise BackdropError("Use an IMDb identifier such as tt31349844.")
@@ -146,10 +165,15 @@ def find_title(
                     or identifier <= 0
                 ):
                     raise BackdropError("TMDB returned an invalid title identifier.")
+                if not imdb_id_explicit and _matching_id(item, titles, year, kind) is None:
+                    raise BackdropIdentityError(
+                        "TMDB's inferred IMDb identity does not match the requested title/year; supply an explicit IMDb identifier."
+                    )
                 matches.add((kind, identifier))
         if len(matches) == 1:
             return next(iter(matches))
-        raise BackdropError(
+        error_type = BackdropError if imdb_id_explicit else BackdropIdentityError
+        raise error_type(
             "TMDB could not uniquely match this IMDb identifier to the selected media type."
         )
     for search_title in titles:
@@ -166,12 +190,22 @@ def find_title(
                 raise BackdropError(
                     "TMDB returned too many candidates; use `/movie schedule imdb:` or a manual backdrop."
                 )
+            seen_pages = set()
             for page in range(1, max(pages, 1) + 1):
                 if page > 1:
                     data = _request(credential, f"/search/{kind}", **params, page=page)
+                if (data.get("page", page) != page
+                        or data.get("total_pages", pages) != pages):
+                    raise BackdropError("TMDB search pages changed; retry or supply an IMDb identifier.")
                 results = data.get("results")
                 if not isinstance(results, list):
                     raise BackdropError("TMDB returned invalid search results.")
+                if pages == 0 and results:
+                    raise BackdropError("TMDB returned invalid search results.")
+                fingerprint = json.dumps(sorted(json.dumps(item, sort_keys=True) for item in results))
+                if fingerprint in seen_pages:
+                    raise BackdropError("TMDB repeated a search page; supply an IMDb identifier.")
+                seen_pages.add(fingerprint)
                 for item in results:
                     identifier = _matching_id(item, [search_title], year, kind)
                     if identifier is not None:
@@ -195,7 +229,8 @@ def _matching_id(item, titles: list[str], year: str | None, kind: str) -> int | 
                for name in names for title in titles):
         return None
     date = item.get("release_date" if kind == "movie" else "first_air_date")
-    if year and (not isinstance(date, str) or date[:4] != year):
+    if (not isinstance(date, str) or not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", date)
+            or (year is not None and date[:4] != year)):
         return None
     identifier = item.get("id")
     if isinstance(identifier, bool) or not isinstance(identifier, int) or identifier <= 0:
@@ -204,7 +239,22 @@ def _matching_id(item, titles: list[str], year: str | None, kind: str) -> int | 
 
 
 def _backdrop_paths(kind: str, identifier: int, credential: Credential) -> list[str]:
-    data = _request(credential, f"/{kind}/{identifier}/images")
+    try:
+        return _image_paths(_request(credential, f"/{kind}/{identifier}/images"))
+    except BackdropError as image_error:
+        # The canonical record can retain its cover when the images listing fails.
+        try:
+            data = _request(credential, f"/{kind}/{identifier}")
+            path = data.get("backdrop_path")
+            if (type(data.get("id")) is int and data["id"] == identifier
+                    and isinstance(path, str) and IMAGE_PATH.fullmatch(path)):
+                return [path]
+        except BackdropError:
+            pass
+        raise image_error
+
+
+def _image_paths(data: dict) -> list[str]:
     images = data.get("backdrops")
     if not isinstance(images, list):
         raise BackdropError("TMDB returned invalid backdrop information.")
@@ -231,50 +281,93 @@ def _backdrop_paths(kind: str, identifier: int, credential: Credential) -> list[
 
 def repair_candidates(query: str, year: str | None, show_type: str) -> list[tuple[str, int, str]]:
     """Offer choices rather than treating the first fuzzy search result as authoritative."""
+    with _lookup_deadline(LOOKUP_TIMEOUT):
+        return _repair_candidates(query, year, show_type)
+
+
+def _repair_candidates(query: str, year: str | None, show_type: str) -> list[tuple[str, int, str]]:
+    _validate_lookup(query, year, show_type, None)
     credential = load_credential()
     kinds = {"movie": ("movie",), "tv": ("tv",)}.get(show_type, ("tv", "movie"))
     choices = []
+    found = (_request(credential, f"/find/{query}", external_source="imdb_id")
+             if IMDB_ID.fullmatch(query) else None)
     for kind in kinds:
-        if IMDB_ID.fullmatch(query):
-            data = _request(credential, f"/find/{query}", external_source="imdb_id")
-            rows = data.get(f"{kind}_results", [])
+        if found is not None:
+            rows = found.get(f"{kind}_results", [])
         else:
             params = {"query": query, "include_adult": "false"}
             if year:
                 params["year" if kind == "movie" else "first_air_date_year"] = year
             rows = _request(credential, f"/search/{kind}", **params).get("results", [])
-        for item in rows[:8]:
+        if not isinstance(rows, list):
+            raise BackdropError("TMDB returned invalid repair candidates.")
+        count = 0
+        seen = set()
+        for item in rows:
+            if not isinstance(item, dict):
+                raise BackdropError("TMDB returned an invalid repair candidate.")
             key = item.get("id")
             name = item.get("title" if kind == "movie" else "name")
             date = item.get("release_date" if kind == "movie" else "first_air_date") or ""
-            if type(key) is int and key > 0 and name and (not year or date[:4] == year):
+            if (type(key) is int and key > 0 and isinstance(name, str) and _normal_title(name)
+                    and isinstance(date, str) and (not year or date[:4] == year)
+                    and key not in seen):
                 choices.append((kind, key, f"{name} ({date[:4] or '?'}, {kind})"))
+                seen.add(key)
+                count += 1
+                if count == 8:
+                    break
     return choices
 
 
 def repair_details(kind: str, identifier: int) -> dict:
-    data = _request(load_credential(), f"/{kind}/{identifier}", append_to_response="credits,external_ids")
-    if data.get("id") != identifier:
+    if kind not in ("movie", "tv") or type(identifier) is not int or identifier <= 0:
+        raise BackdropError("Select a valid TMDB movie or series.")
+    with _lookup_deadline(LOOKUP_TIMEOUT):
+        data = _request(load_credential(), f"/{kind}/{identifier}", append_to_response="credits,external_ids")
+    if type(data.get("id")) is not int or data["id"] != identifier:
         raise BackdropError("TMDB did not confirm the selected title.")
-    cast = data.get("credits", {}).get("cast", [])
-    crew = data.get("credits", {}).get("crew", [])
-    return dict(title=data.get("title") or data["name"],
-                year=(data.get("release_date") or data.get("first_air_date") or "")[:4],
-                imdb_id=data.get("external_ids", {}).get("imdb_id"),
-                overview=data.get("overview") or "", runtime=data.get("runtime"),
-                people=", ".join([p["name"] for p in crew if p.get("job") == "Director"][:1]
-                                 + [p["name"] for p in cast[:3]]))
+    title = data.get("title" if kind == "movie" else "name")
+    date = data.get("release_date" if kind == "movie" else "first_air_date")
+    credits, external_ids = data.get("credits"), data.get("external_ids")
+    if (not isinstance(title, str) or not _normal_title(title)
+            or not isinstance(date, str) or not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", date)
+            or not isinstance(credits, dict) or not isinstance(external_ids, dict)):
+        raise BackdropError("TMDB returned invalid title details.")
+    cast, crew = credits.get("cast", []), credits.get("crew", [])
+    if not isinstance(cast, list) or not isinstance(crew, list):
+        raise BackdropError("TMDB returned invalid credits.")
+    imdb_id = external_ids.get("imdb_id")
+    if imdb_id is not None and (not isinstance(imdb_id, str) or not IMDB_ID.fullmatch(imdb_id)):
+        raise BackdropError("TMDB returned an invalid IMDb identifier.")
+    overview, runtime = data.get("overview") or "", data.get("runtime")
+    if (not isinstance(overview, str) or (runtime is not None
+            and (type(runtime) is not int or runtime < 0))):
+        raise BackdropError("TMDB returned invalid title details.")
+    directors = [p["name"] for p in crew if isinstance(p, dict)
+                 and p.get("job") == "Director" and isinstance(p.get("name"), str)]
+    actors = [p["name"] for p in cast if isinstance(p, dict) and isinstance(p.get("name"), str)]
+    return dict(title=title, year=date[:4], imdb_id=imdb_id,
+                overview=overview, runtime=runtime,
+                people=", ".join(directors[:1] + actors[:3]))
 
 
 def repair_artwork(kind: str, identifier: int) -> list[str]:
-    return _backdrop_paths(kind, identifier, load_credential())[:3]
+    if kind not in ("movie", "tv") or type(identifier) is not int or identifier <= 0:
+        raise BackdropError("Select a valid TMDB movie or series.")
+    with _lookup_deadline(LOOKUP_TIMEOUT):
+        return _backdrop_paths(kind, identifier, load_credential())[:3]
 
 
 def repair_cover(path: str) -> bytes:
-    if not IMAGE_PATH.fullmatch(path):
+    if not isinstance(path, str) or not IMAGE_PATH.fullmatch(path):
         raise BackdropError("TMDB returned an invalid image path.")
-    return validated_image(_read(Request(IMAGE_BASE + path, headers={"User-Agent": "MovieNightBot/1.0"}),
-                                 MAX_IMAGE_BYTES, provider="TMDB image CDN"))
+    with _lookup_deadline(LOOKUP_TIMEOUT):
+        return validated_image(_read(
+            Request(IMAGE_BASE + path, headers={"User-Agent": "MovieNightBot/1.0"}),
+            MAX_IMAGE_BYTES, provider="TMDB image CDN",
+        ))
 
 
 def validated_image(data: bytes) -> bytes:
@@ -299,8 +392,7 @@ def validated_image(data: bytes) -> bytes:
         raise BackdropError("The backdrop could not be decoded as a valid image.") from None
 
 
-def save_image(data: bytes, dest: Path) -> Path:
-    encoded = validated_image(data)
+def _atomic_write(encoded: bytes, dest: Path) -> Path:
     temporary = None
     try:
         dest.parent.mkdir(parents=True, exist_ok=True)
@@ -316,44 +408,106 @@ def save_image(data: bytes, dest: Path) -> Path:
             temporary.unlink()
 
 
+def save_image(data: bytes, dest: Path) -> Path:
+    return _atomic_write(validated_image(data), dest)
+
+
 def manual_backdrop(data: bytes, directory: Path = TMP) -> Path:
     return save_image(data, directory / "backdrops" / f"manual-{hashlib.sha256(data).hexdigest()}.jpg")
 
 
-def fetch_backdrop(
-    title: str, year: str | None = None, show_type: str = "movie",
-    *, directory: Path = TMP, imdb_id: str | None = None,
-) -> Path:
-    if not title.strip() or (year and not re.fullmatch(r"\d{4}", year)):
+def _validate_lookup(title, year, show_type, imdb_id):
+    if (not isinstance(title, str) or not _normal_title(title)
+            or (year is not None and (not isinstance(year, str) or not re.fullmatch(r"[0-9]{4}", year)))):
         raise BackdropError("Provide a movie title and, optionally, a four-digit release year.")
-    if imdb_id and not IMDB_ID.fullmatch(imdb_id):
+    if show_type not in ("movie", "tv", "anime", "other"):
+        raise BackdropError("Select movie, TV, anime or other as the media type.")
+    if imdb_id is not None and (not isinstance(imdb_id, str) or not IMDB_ID.fullmatch(imdb_id)):
         raise BackdropError("Use an IMDb identifier such as tt31349844.")
-    identity = [title.strip().casefold(), year, show_type]
-    if imdb_id:
-        identity.append(imdb_id)
+
+
+def _cached_backdrop(manifest: Path, identity: list) -> Path | None:
+    try:
+        with manifest.open("rb") as file:
+            raw = file.read(4097)
+        if len(raw) > 4096:
+            raise ValueError
+        data = json.loads(raw)
+        if (not isinstance(data, dict) or data.get("identity") != identity
+                or data.get("version") != CACHE_VERSION
+                or data.get("kind") not in ("movie", "tv")
+                or type(data.get("tmdb_id")) is not int or data["tmdb_id"] <= 0
+                or not isinstance(data.get("sha256"), str)
+                or not re.fullmatch(r"[a-f0-9]{64}", data["sha256"])):
+            raise ValueError
+        created = data.get("created")
+        if (type(created) not in (int, float) or not math.isfinite(created)
+                or not 0 <= time.time() - created <= CACHE_MAX_AGE):
+            raise ValueError
+        path = manifest.parent / f"{manifest.stem}-{data['sha256']}.jpg"
+        with path.open("rb") as file:
+            image_data = file.read(MAX_IMAGE_BYTES + 1)
+        if hashlib.sha256(image_data).hexdigest() != data["sha256"]:
+            raise ValueError
+        validated_image(image_data)
+        return path
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError, UnicodeError, BackdropError):
+        print("WARN: cached backdrop is invalid or expired; fetching a fresh image.", file=sys.stderr)
+        return None
+
+
+def _fetch_backdrop(
+    title: str, year: str | None = None, show_type: str = "movie",
+    *, directory: Path = TMP, imdb_id: str | None = None, imdb_id_explicit: bool = True,
+) -> Path:
+    _validate_lookup(title, year, show_type, imdb_id)
+    identity = [CACHE_VERSION, title.strip().casefold(), year, show_type, imdb_id,
+                bool(imdb_id and imdb_id_explicit)]
     cache_key = hashlib.sha256(json.dumps(identity).encode()).hexdigest()
-    dest = directory / "backdrops" / f"tmdb-{cache_key}.jpg"
-    if dest.exists():
-        try:
-            with dest.open("rb") as file:
-                validated_image(file.read(MAX_IMAGE_BYTES + 1))
-            return dest
-        except (OSError, BackdropError):
-            print("WARN: cached backdrop is invalid; fetching a fresh image.", file=sys.stderr)
+    manifest = directory / "backdrops" / f"tmdb-v{CACHE_VERSION}-{cache_key}.json"
+    cached = _cached_backdrop(manifest, identity)
+    if cached is not None:
+        return cached
     credential = load_credential()
-    kind, identifier = find_title(title, year, show_type, credential, imdb_id)
+    kind, identifier = find_title(
+        title, year, show_type, credential, imdb_id, imdb_id_explicit=imdb_id_explicit,
+    )
     paths = _backdrop_paths(kind, identifier, credential)
     failures = []
-    for path in paths[:3]:
+    for path in paths[:MAX_IMAGE_CANDIDATES]:
         try:
             raw = _read(
                 Request(IMAGE_BASE + path, headers={"User-Agent": "MovieNightBot/1.0"}),
                 MAX_IMAGE_BYTES, provider="TMDB image CDN",
             )
-            return save_image(raw, dest)
+            encoded = validated_image(raw)
+            digest = hashlib.sha256(encoded).hexdigest()
+            dest = manifest.parent / f"{manifest.stem}-{digest}.jpg"
+            _atomic_write(encoded, dest)
+            # The atomic pointer references immutable content, so concurrent writers
+            # cannot mix one image with another writer's identity/digest.
+            _atomic_write(json.dumps(dict(
+                version=CACHE_VERSION, identity=identity, kind=kind,
+                tmdb_id=identifier, sha256=digest, created=time.time(),
+            )).encode(), manifest)
+            return dest
         except BackdropError as exc:
             failures.append(str(exc))
     raise BackdropError("No backdrop could be downloaded: " + "; ".join(dict.fromkeys(failures)))
+
+
+def fetch_backdrop(
+    title: str, year: str | None = None, show_type: str = "movie",
+    *, directory: Path = TMP, imdb_id: str | None = None, imdb_id_explicit: bool = True,
+) -> Path:
+    """Cache only validated identities; inferred IDs must also match title/year."""
+    with _lookup_deadline(LOOKUP_TIMEOUT):
+        return _fetch_backdrop(
+            title, year, show_type, directory=directory,
+            imdb_id=imdb_id, imdb_id_explicit=imdb_id_explicit,
+        )
 
 
 def main() -> int:
@@ -361,12 +515,20 @@ def main() -> int:
     parser.add_argument("title")
     parser.add_argument("year", nargs="?")
     parser.add_argument("--show-type", choices=("movie", "tv", "anime", "other"), default="movie")
-    parser.add_argument("--imdb-id")
+    identifiers = parser.add_mutually_exclusive_group()
+    identifiers.add_argument("--imdb-id")
+    identifiers.add_argument("--inferred-imdb-id")
     args = parser.parse_args()
     try:
-        print(fetch_backdrop(args.title, args.year, args.show_type, imdb_id=args.imdb_id))
+        print(fetch_backdrop(
+            args.title, args.year, args.show_type,
+            imdb_id=args.imdb_id or args.inferred_imdb_id,
+            imdb_id_explicit=args.inferred_imdb_id is None,
+        ))
         return 0
     except BackdropError as exc:
+        if isinstance(exc, BackdropIdentityError):
+            print("ERROR_CODE: inferred_identity_mismatch", file=sys.stderr)
         print(f"ERROR: {exc}", file=sys.stderr)
         print("NONE")
         return 1
