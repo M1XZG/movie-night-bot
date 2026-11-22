@@ -224,13 +224,18 @@ class CancellationAndRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.pending("pending")
         self.list.return_value = [{"id": "cal-before"}]
         self.create.side_effect = bot.vrchat.VRChatWriteUncertainError(
-            "Rollback unclear", 403, existing_ids=["cal-before"], calendar_id="cal-uncertain")
+            "Fields unconfirmed", 403, existing_ids=["cal-before"], calendar_id="cal-uncertain",
+            validation_problems=["VRChat did not confirm the requested description"])
         await bot.create_record_vrc(self.rec, self.conf)
         self.assertEqual(self.rec["vrc_state"], "unknown")
         self.assertEqual(self.rec["vrc_existing_ids"], ["cal-before"])
         self.assertEqual(self.rec["vrc_event_id"], "cal-uncertain")
+        self.assertEqual(self.rec["vrc_last_error"]["validation_problems"],
+                         ["VRChat did not confirm the requested description"])
         self.assertEqual(self.create.await_args.kwargs["existing_ids"], ["cal-before"])
         self.delete_file.assert_not_awaited()
+        await bot.create_record_vrc(self.rec, self.conf)
+        self.create.assert_awaited_once()
 
     async def test_index_is_saved_with_baseline_before_calendar_write(self):
         self.pending("pending")

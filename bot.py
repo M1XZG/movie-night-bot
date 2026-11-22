@@ -967,6 +967,9 @@ async def create_record_vrc(record, conf, img_bytes=None, *, existing_ids=None):
     except vrchat.VRChatError as exc:
         log(f"vrchat_stage=preflight error_type={type(exc).__name__} status={exc.status}")
         record["vrc_state"] = "failed"
+        record["vrc_last_error"] = {
+            "stage": "preflight", "type": type(exc).__name__, "http_status": exc.status,
+        }
         save_events(strict=True)
         return ":warning: VRChat calendar could not be read; no creation was attempted. Check the link and recover later."
     record["vrc_existing_ids"] = list(existing_ids)
@@ -991,6 +994,7 @@ async def create_record_vrc(record, conf, img_bytes=None, *, existing_ids=None):
     record["vrc_state"] = "creating"
     save_events(strict=True)
     started = time.monotonic()
+    failure = None
     try:
         event = await vrchat.create_event(cookies, record["vrc_group_id"], record["vrc_payload"],
                                           existing_ids=record["vrc_existing_ids"])
@@ -1004,23 +1008,40 @@ async def create_record_vrc(record, conf, img_bytes=None, *, existing_ids=None):
             result += " (with the movie image)"
         elif warning:
             result += "\n:warning: " + warning
-    except vrchat.VRChatAuthError:
+    except vrchat.VRChatAuthError as exc:
+        failure = {"stage": "calendar_create", "type": type(exc).__name__, "http_status": exc.status}
         record["vrc_state"] = "failed"
         result = (":warning: VRChat session expired. Run `/movie-vrchat link`, then "
                   "`/movie-vrchat recover`. The Discord booking is saved.")
     except vrchat.VRChatWriteUncertainError as exc:
+        failure = {
+            "stage": "calendar_create", "type": type(exc).__name__,
+            "http_status": exc.status, "validation_problems": list(exc.validation_problems),
+        }
         record.update(vrc_state="unknown", vrc_existing_ids=list(exc.existing_ids))
         if exc.calendar_id:
             record["vrc_event_id"] = exc.calendar_id
-        result = (":warning: VRChat creation is uncertain. The submitted request and cover are saved. "
-                  "Use `/movie-vrchat recover`; do not create another event.")
+            result = (":warning: VRChat created an event, but its fields need review. "
+                      "The event and cover are retained. Use `/movie-vrchat recover`; "
+                      "do not create another event.")
+        else:
+            result = (":warning: VRChat creation is uncertain. The submitted request and cover are saved. "
+                      "Use `/movie-vrchat recover`; do not create another event.")
     except (vrchat.VRChatError, asyncio.TimeoutError) as exc:
+        failure = {
+            "stage": "calendar_create", "type": type(exc).__name__,
+            "http_status": getattr(exc, "status", None),
+        }
         record["vrc_state"] = "unknown" if isinstance(exc, asyncio.TimeoutError) else "failed"
         result = (":warning: VRChat calendar creation was not confirmed. Use "
                   "`/movie-vrchat recover` to reconcile it before retrying. The uploaded cover is retained.")
+    if failure:
+        record["vrc_last_error"] = failure
+    else:
+        record.pop("vrc_last_error", None)
     save_events(strict=True)
     log(f"vrchat_stage=calendar_create state={record['vrc_state']} "
-        f"elapsed_seconds={time.monotonic() - started:.2f}")
+        f"elapsed_seconds={time.monotonic() - started:.2f} error={json.dumps(failure)}")
     return result
 
 

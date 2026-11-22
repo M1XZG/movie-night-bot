@@ -407,10 +407,11 @@ Pass `vrchat:False` on `/movie schedule` to skip the VRChat event for a single
 Discord-only watch party.
 
 Events are explicitly published with `isDraft:false` and target Windows,
-Android and iOS clients. The bot also checks the create response and removes
-the event instead of reporting success if VRChat leaves it as a draft or
-returns no target platforms. Both fields are required for reliable in-client
-start notifications.
+Android and iOS clients. The bot checks the create response and reads incomplete
+responses back before reporting success. If stored fields still cannot be
+verified, it retains the accepted event ID and artwork for review instead of
+deleting and recreating it. Draft or invalid-platform events are not reported as
+successful. Both fields are required for reliable in-client start notifications.
 
 **Early start (optional).** VRChat only fires its "event starting soon"
 announcement when the event begins, so the notice can arrive after the movie has

@@ -78,17 +78,18 @@ class VRChatWriteUncertainError(VRChatError):
 
     For calendar creation, persist ``existing_ids`` with the submitted payload
     to use ``find_created_event`` after the session/network has recovered.
-    ``calendar_id`` identifies an event whose rollback could not be confirmed.
+    ``calendar_id`` identifies an accepted event whose fields need review.
     """
 
     preserve_image = True
 
     def __init__(self, message, status=None, *, operation="create",
-                 calendar_id=None, existing_ids=()):
+                 calendar_id=None, existing_ids=(), validation_problems=()):
         super().__init__(message, status)
         self.operation = operation
         self.calendar_id = calendar_id
         self.existing_ids = tuple(existing_ids)
+        self.validation_problems = tuple(validation_problems)
 
 
 # --------------------------------------------------------------------------- #
@@ -329,7 +330,7 @@ def _validate_id(value, prefix):
 def _normalise_event_title(value):
     if not isinstance(value, str):
         return ""
-    value = unicodedata.normalize("NFKD", value).casefold()
+    value = unicodedata.normalize("NFKD", _normalise_event_description(value)).casefold()
     value = "".join(char for char in value if not unicodedata.combining(char))
     return " ".join(re.findall(r"[^\W_]+", value))
 
@@ -347,11 +348,11 @@ def _normalise_event_time(value):
 
 
 def _normalise_event_description(value):
-    """VRChat stores these punctuation substitutions in calendar descriptions."""
+    """VRChat stores these punctuation substitutions in calendar text."""
     if not isinstance(value, str):
         return None
     return value.translate(str.maketrans({
-        "\u2024": ".", "\u201a": ",", "\u02f8": ":", "\u2044": "/",
+        "\u2024": ".", "\u201a": ",", "\u02f8": ":", "\u2044": "/", "\u01c3": "!",
     }))
 
 
@@ -527,13 +528,12 @@ def _create_event_sync(cookies, group_id, payload, existing_ids=None):
             raise VRChatWriteUncertainError(
                 f"VRChat creation response could not be verified: {error.message}",
                 error.status, calendar_id=event["id"], existing_ids=existing_ids) from error
-        try:
-            _delete_event_sync(cookies, group_id, event["id"])
-        except VRChatError as error:
-            raise VRChatWriteUncertainError(
-                "; ".join(problems) + "; event rollback could not be confirmed.",
-                error.status, calendar_id=event["id"], existing_ids=existing_ids) from error
-        raise VRChatError("; ".join(problems) + "; event removed.", status)
+        # Creation notifications cannot be undone. Retain the accepted ID so
+        # another unknown text transformation cannot cause delete/recreate loops.
+        raise VRChatWriteUncertainError(
+            "; ".join(problems) + "; created event retained for review.",
+            status, calendar_id=event["id"], existing_ids=existing_ids,
+            validation_problems=problems)
     return event
 
 
