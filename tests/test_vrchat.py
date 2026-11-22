@@ -503,9 +503,20 @@ class UploadAndCleanupTests(NoSleepTests):
                 (vrchat._delete_file_sync, ({}, "file_art")),
             ]:
                 with self.subTest(status=status, operation=operation), mock.patch.object(
-                    vrchat, "_request", return_value=(status, "", {})
+                    vrchat, "_request", side_effect=(
+                        [(status, "", {}), (404, "", {})] if operation is vrchat._delete_file_sync
+                        else [(status, "", {})]
+                    )
                 ):
                     self.assertEqual(operation(*arguments), expected)
+
+    def test_file_deletion_is_not_complete_while_file_remains(self):
+        with mock.patch.object(vrchat, "_request", side_effect=[
+            response({"id": "file_art"}), response({"id": "file_art"})
+        ]) as request:
+            with self.assertRaisesRegex(vrchat.VRChatError, "could not be confirmed"):
+                vrchat._delete_file_sync({}, "file_art")
+        self.assertEqual([call.args[0] for call in request.call_args_list], ["DELETE", "GET"])
 
 
 class AuthenticationTests(NoSleepTests):

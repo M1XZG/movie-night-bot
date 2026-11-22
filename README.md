@@ -427,7 +427,11 @@ event/announcement still use the real start time.
 `file_…` id is set as the event's `imageId` — so the VRChat event shows the
 movie image instead of the group's banner. When the event is cancelled, the
 uploaded image is also deleted from the linked account
-(`DELETE /file/{fileId}`). Image handling is best-effort: if Pillow is missing,
+(`DELETE /file/{fileId}`), with a readback confirming that the file is gone.
+Cancellation captures the calendar's current image before deleting the event
+and also cleans artwork IDs saved in its payload or unfinished repairs.
+Failed cleanup retains the booking for retry; artwork still needed by another
+booking is not deleted. Image handling is best-effort: if Pillow is missing,
 the upload fails, or no backdrop is found, the event simply falls back to the
 group banner. (Requires `Pillow` — see `requirements.txt`.)
 

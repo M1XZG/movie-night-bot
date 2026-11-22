@@ -1370,6 +1370,15 @@ async def movie_cancel(interaction: discord.Interaction, movie: str):
         ACTIVE.discard(key)
 
 
+def _artwork_file_ids(rec):
+    return set(filter(None, (
+        rec.get("vrc_file_id"), (rec.get("vrc_payload") or {}).get("imageId"),
+        (rec.get("repair_pending") or {}).get("upload_id"),
+        *(rec.get("retained_vrc_files") or []),
+        *(rec.get("cancel_artwork_ids") or []),
+    )))
+
+
 async def cancel_record(interaction, rec):
     guild = interaction.guild
     event_id = rec["event_id"]
@@ -1423,6 +1432,20 @@ async def cancel_record(interaction, rec):
             try:
                 if not vconf_g.get("auth_cookie") or vconf_g.get("group_id") != rec["vrc_group_id"]:
                     raise ValueError("VRChat login or group changed.")
+                try:
+                    current = await vrchat.get_event(
+                        cookies, rec["vrc_group_id"], rec["vrc_event_id"])
+                except vrchat.VRChatError as exc:
+                    if exc.status != 404:
+                        raise
+                    current = {}
+                image_id = current.get("imageId")
+                if image_id:
+                    vrchat._validate_id(image_id, "file")
+                    captured = rec.setdefault("cancel_artwork_ids", [])
+                    if image_id not in captured:
+                        captured.append(image_id)
+                    save_events(strict=True)
                 ok = await vrchat.delete_event(
                     cookies, rec["vrc_group_id"], rec["vrc_event_id"])
                 progress["vrchat"] = True
@@ -1437,19 +1460,41 @@ async def cancel_record(interaction, rec):
         save_events(strict=True)
 
     # A cover is safe to remove only once the calendar event is confirmed gone.
-    if not progress.get("images") and progress.get("vrchat"):
-        files = set(filter(None, (rec.get("vrc_file_id"), rec.get("repair_pending", {}).get("upload_id"),
-                                  *rec.get("retained_vrc_files", []))))
+    if progress.get("vrchat"):
+        files = _artwork_file_ids(rec)
+        shared = set()
+        for records in EVENTS.values():
+            for other in records:
+                if other.get("event_id") == event_id:
+                    continue
+                if other.get("cancel_requested") and (other.get("cancel_progress") or {}).get("vrchat"):
+                    continue
+                if other.get("vrc_event_id") or other.get("vrc_state") in ("pending", "failed", "creating", "unknown"):
+                    shared.update(_artwork_file_ids(other))
         removed = rec.setdefault("cancelled_files", [])
-        for file_id in files.difference(removed):
+        errors = rec.setdefault("cancel_file_errors", {})
+        deleted_count = absent_count = 0
+        for file_id in files.difference(removed, shared):
             try:
                 if not vconf_g.get("auth_cookie") or vconf_g.get("group_id") != rec.get("vrc_group_id"):
                     raise ValueError("VRChat login or group changed.")
-                await vrchat.delete_file(cookies, file_id)
+                deleted = await vrchat.delete_file(cookies, file_id)
                 removed.append(file_id)
-            except (ValueError, vrchat.VRChatError, asyncio.TimeoutError, OSError):
+                errors.pop(file_id, None)
+                deleted_count += bool(deleted)
+                absent_count += not deleted
+            except (ValueError, vrchat.VRChatError, asyncio.TimeoutError, OSError) as exc:
+                errors[file_id] = {"type": type(exc).__name__, "http_status": getattr(exc, "status", None)}
+                log(f"vrchat_stage=cancel_artwork error_type={type(exc).__name__} "
+                    f"status={getattr(exc, 'status', None)}")
                 notes.append("⚠️ VRChat image cleanup failed; retry cancellation")
             save_events(strict=True)
+        if deleted_count:
+            notes.append(f"{deleted_count} VRChat artwork file{'s' if deleted_count != 1 else ''} deleted")
+        if absent_count:
+            notes.append(f"{absent_count} VRChat artwork file{'s' if absent_count != 1 else ''} already gone")
+        if files.intersection(shared).difference(removed):
+            notes.append("⚠️ Artwork is still tracked by another booking; cleanup deferred")
         progress["images"] = files.issubset(removed)
         save_events(strict=True)
 

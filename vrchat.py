@@ -668,18 +668,20 @@ def _upload_image_sync(cookies, png_bytes, tag="gallery", filename="movie.png"):
 
 def _delete_file_sync(cookies, file_id):
     _validate_id(file_id, "file")
-    status, raw, _ = _request("DELETE", f"/file/{file_id}", cookies=cookies)
+    status, raw, _ = _request("DELETE", f"/file/{file_id}", cookies=cookies, timeout=10)
     if status == 401:
         raise VRChatAuthError("VRChat session expired.", 401)
-    if status == 404:
-        return False
-    # A file that's still referenced can return 4xx; treat as best-effort.
-    if status not in (200, 204):
+    if status not in (200, 204, 404):
         raise VRChatError(
             _err_message(raw) or f"could not delete file ({status})", status)
-    if raw:
+    if raw and status != 404:
         _json_object(raw, "file deletion", status)
-    return True
+    verified_status, _, _ = _request("GET", f"/file/{file_id}", cookies=cookies, timeout=10)
+    if verified_status == 401:
+        raise VRChatAuthError("VRChat session expired while verifying artwork deletion.", 401)
+    if verified_status != 404:
+        raise VRChatError("VRChat artwork deletion could not be confirmed.", verified_status)
+    return status != 404
 
 
 # --------------------------------------------------------------------------- #
