@@ -83,6 +83,19 @@ class EventPayloadTests(unittest.TestCase):
 
 
 class EventCreationTests(NoSleepTests):
+    def test_exclamation_sanitisation_in_title_and_fallback_description_is_accepted(self):
+        wanted = payload(
+            title="Movie Night: Horton Hears a Who!",
+            description="Movie Night: horton hears a who. Grab snacks and join us!",
+        )
+        stored = event(
+            title="Movie Night\u02f8 Horton Hears a Who\u01c3",
+            description="Movie Night\u02f8 horton hears a who\u2024 Grab snacks and join us\u01c3",
+        )
+        with mock.patch.object(vrchat, "_request", side_effect=[listing(), response(stored)]) as request:
+            self.assertEqual(vrchat._create_event_sync({}, "grp_test", wanted), stored)
+        self.assertEqual([call.args[0] for call in request.call_args_list], ["GET", "POST"])
+
     def test_sanitised_description_is_accepted_without_rollback(self):
         wanted = payload(description="Watch: this film, now. https://www.imdb.com/title/tt0468569/")
         stored = event(description="Watch\u02f8 this film\u201a now\u2024 https\u02f8\u2044\u2044www\u2024imdb\u2024com\u2044title\u2044tt0468569\u2044")
@@ -128,19 +141,18 @@ class EventCreationTests(NoSleepTests):
         self.assertEqual(self.sleep.call_count, 2)
         self.assertEqual(sum(call.args[0] == "POST" for call in request.call_args_list), 1)
 
-    def test_draft_response_is_deleted_and_rejected(self):
+    def test_draft_response_is_retained_for_review_without_reporting_success(self):
         created = event(isDraft=True, platforms=[])
         responses = [
             listing(), response(created), response(created),
-            (204, "", {}),
         ]
         with mock.patch.object(vrchat, "_request", side_effect=responses) as request:
-            with self.assertRaisesRegex(vrchat.VRChatError, "draft") as caught:
+            with self.assertRaisesRegex(vrchat.VRChatWriteUncertainError, "draft") as caught:
                 vrchat._create_event_sync({"auth": "test"}, "grp_test", payload())
 
-        self.assertNotIsInstance(caught.exception, vrchat.VRChatWriteUncertainError)
-        self.assertEqual(request.call_count, 4)
-        self.assertEqual(request.call_args_list[3].args[:2], ("DELETE", "/calendar/grp_test/cal_new"))
+        self.assertEqual(caught.exception.calendar_id, "cal_new")
+        self.assertEqual(request.call_count, 3)
+        self.assertFalse(any(call.args[0] == "DELETE" for call in request.call_args_list))
 
     def test_timeout_after_accepted_post_is_reconciled(self):
         with mock.patch.object(vrchat, "_request", side_effect=[
@@ -216,7 +228,7 @@ class EventCreationTests(NoSleepTests):
             with self.assertRaises(vrchat.VRChatWriteUncertainError):
                 vrchat._create_event_sync({}, "grp_test", payload())
 
-    def test_partial_success_response_is_read_back_before_rollback(self):
+    def test_partial_success_response_is_read_back_before_reporting_uncertainty(self):
         with mock.patch.object(vrchat, "_request", side_effect=[
             listing(), response({"id": "cal_new"}), response(event())
         ]) as request:
@@ -224,15 +236,28 @@ class EventCreationTests(NoSleepTests):
                 vrchat._create_event_sync({}, "grp_test", payload())["imageId"], "file_art")
         self.assertEqual(request.call_args_list[-1].args[:2], ("GET", "/calendar/grp_test/cal_new"))
 
-    def test_rollback_failure_retains_live_artwork_and_calendar_id(self):
+    def test_verified_mismatch_retains_live_artwork_and_calendar_id(self):
         invalid = event(imageId="file_wrong")
         with mock.patch.object(vrchat, "_request", side_effect=[
-            listing(), response(invalid), response(invalid), response({"error": "Failed"}, 500)
-        ]):
+            listing(), response(invalid), response(invalid)
+        ]) as request:
             with self.assertRaises(vrchat.VRChatWriteUncertainError) as caught:
                 vrchat._create_event_sync({}, "grp_test", payload())
         self.assertTrue(caught.exception.preserve_image)
         self.assertEqual(caught.exception.calendar_id, "cal_new")
+        self.assertIn("VRChat did not confirm the requested imageId", caught.exception.validation_problems)
+        self.assertFalse(any(call.args[0] == "DELETE" for call in request.call_args_list))
+
+    def test_unrecognised_text_change_cannot_trigger_delete_and_recreate(self):
+        stored = event(description="Another, unconfirmed transformation.")
+        with mock.patch.object(vrchat, "_request", side_effect=[
+            listing(), response(stored), response(stored)
+        ]) as request:
+            with self.assertRaises(vrchat.VRChatWriteUncertainError) as caught:
+                vrchat._create_event_sync({}, "grp_test", payload())
+        self.assertEqual(caught.exception.calendar_id, "cal_new")
+        self.assertEqual(caught.exception.validation_problems, ("VRChat did not confirm the requested description",))
+        self.assertEqual([call.args[0] for call in request.call_args_list], ["GET", "POST", "GET"])
 
     def test_unreadable_created_event_is_not_blindly_deleted(self):
         with mock.patch.object(vrchat, "_request", side_effect=[
