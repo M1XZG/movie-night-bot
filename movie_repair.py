@@ -556,7 +556,8 @@ async def apply_target(s, guild, rec, target):
             updated = await vrchat.update_event(cookies, rec["vrc_group_id"], rec["vrc_event_id"], fields)
         if not text_only and updated.get("imageId") != s.upload_id:
             raise ValueError("VRChat did not confirm the new cover.")
-        if identity and (updated.get("description") != s.synopsis or
+        if identity and (vrchat._normalise_event_description(updated.get("description"))
+                         != vrchat._normalise_event_description(s.synopsis) or
                          vrchat._normalise_event_title(updated.get("title","").replace("˸",":"))
                          != vrchat._normalise_event_title(s.vname)):
             raise ValueError("VRChat did not confirm the updated film details.")

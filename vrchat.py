@@ -346,6 +346,15 @@ def _normalise_event_time(value):
     return None
 
 
+def _normalise_event_description(value):
+    """VRChat stores these punctuation substitutions in calendar descriptions."""
+    if not isinstance(value, str):
+        return None
+    return value.translate(str.maketrans({
+        "\u2024": ".", "\u201a": ",", "\u02f8": ":", "\u2044": "/",
+    }))
+
+
 def _list_events_sync(cookies, group_id):
     """Enumerate one calendar snapshot within a shared page/retry time budget."""
     _validate_id(group_id, "grp")
@@ -413,6 +422,9 @@ def _event_problems(event, payload):
         elif field in ("startsAt", "endsAt"):
             matches = (_normalise_event_time(expected) is not None and
                        _normalise_event_time(expected) == _normalise_event_time(actual))
+        elif field == "description":
+            matches = (isinstance(expected, str) and
+                       _normalise_event_description(expected) == _normalise_event_description(actual))
         else:
             matches = actual == expected
         if not matches:
