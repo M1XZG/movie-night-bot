@@ -199,9 +199,15 @@ class RepairTests(unittest.IsolatedAsyncioTestCase):
         self.rec["vrc_file_id"] = "file-original"
         self.s.snapshot = self.rec.copy()
         details = dict(title="The Dark Knight", year="2008", imdb_id="tt0468569",
-                       runtime=152, people="Christopher Nolan", overview="Verified synopsis.")
+                       runtime=152, people="Christopher Nolan", overview="Verified, matching synopsis.")
         self.ev.edit.side_effect = lambda **kwargs: NS(cover_image=True, **kwargs)
-        write = AsyncMock(side_effect=lambda cookies, group, event, fields: dict(fields))
+        def sanitised_update(cookies, group, event, fields):
+            returned = dict(fields)
+            returned["description"] = fields["description"].translate(str.maketrans({
+                ".": "\u2024", ",": "\u201a", ":": "\u02f8", "/": "\u2044",
+            }))
+            return returned
+        write = AsyncMock(side_effect=sanitised_update)
         upload, delete, cover = AsyncMock(), AsyncMock(), Mock()
         with patch.object(repair, "read_vrc", AsyncMock(return_value=({}, {"imageId": "file-original"}))), \
              patch.object(repair, "fetch_ratings", return_value=repair.MovieRatings()), \

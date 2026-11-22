@@ -83,6 +83,14 @@ class EventPayloadTests(unittest.TestCase):
 
 
 class EventCreationTests(NoSleepTests):
+    def test_sanitised_description_is_accepted_without_rollback(self):
+        wanted = payload(description="Watch: this film, now. https://www.imdb.com/title/tt0468569/")
+        stored = event(description="Watch\u02f8 this film\u201a now\u2024 https\u02f8\u2044\u2044www\u2024imdb\u2024com\u2044title\u2044tt0468569\u2044")
+        with mock.patch.object(vrchat, "_request", side_effect=[listing(), response(stored)]) as request:
+            result = vrchat._create_event_sync({}, "grp_test", wanted)
+        self.assertEqual(result, stored)
+        self.assertEqual([call.args[0] for call in request.call_args_list], ["GET", "POST"])
+
     def test_server_error_recovers_event_created_by_vrchat(self):
         created = event(
             title="Movie Night˸ Hackers", startsAt="2026-11-04T19:50:00.000000+01:00",
@@ -353,6 +361,22 @@ class PaginationTests(NoSleepTests):
 
 
 class EventUpdateTests(NoSleepTests):
+    def test_sanitised_description_confirms_update_without_repeating_put(self):
+        wanted = {"description": "Watch: this film, now. https://www.imdb.com/title/tt0468569/"}
+        stored = event(description="Watch\u02f8 this film\u201a now\u2024 https\u02f8\u2044\u2044www\u2024imdb\u2024com\u2044title\u2044tt0468569\u2044")
+        with mock.patch.object(vrchat, "_request", return_value=response(stored)) as request:
+            result = vrchat._update_event_sync({}, "grp_test", "cal_new", wanted)
+        self.assertEqual(result, stored)
+        self.assertEqual([call.args[0] for call in request.call_args_list], ["PUT"])
+
+    def test_punctuation_equivalence_never_accepts_a_different_film(self):
+        wanted = {"description": "IMDb: https://www.imdb.com/title/tt0468569/"}
+        stored = event(description="IMDb\u02f8 https\u02f8\u2044\u2044www\u2024imdb\u2024com\u2044title\u2044tt2098632\u2044")
+        with mock.patch.object(vrchat, "_request", return_value=response(stored)) as request:
+            with self.assertRaises(vrchat.VRChatWriteUncertainError):
+                vrchat._update_event_sync({}, "grp_test", "cal_new", wanted)
+        self.assertEqual(sum(call.args[0] == "PUT" for call in request.call_args_list), 1)
+
     def test_timeout_after_accepted_update_is_read_back_without_repeating_put(self):
         updated = event(imageId="file_new")
         with mock.patch.object(vrchat, "_request", side_effect=[
