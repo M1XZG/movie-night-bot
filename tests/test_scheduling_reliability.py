@@ -127,6 +127,8 @@ class CancellationAndRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.stack.enter_context(patch.object(bot, "log"))
         self.delete_event = self.stack.enter_context(patch.object(bot.vrchat, "delete_event", AsyncMock(return_value=True)))
         self.delete_file = self.stack.enter_context(patch.object(bot.vrchat, "delete_file", AsyncMock(return_value=True)))
+        self.get_event = self.stack.enter_context(patch.object(
+            bot.vrchat, "get_event", AsyncMock(return_value={"id": "cal-test", "imageId": None})))
         self.create = self.stack.enter_context(patch.object(bot.vrchat, "create_event", AsyncMock(return_value={"id": "cal-new"})))
         self.list = self.stack.enter_context(patch.object(bot.vrchat, "list_events", AsyncMock(return_value=[])))
         self.find = self.stack.enter_context(patch.object(bot.vrchat, "find_created_event", AsyncMock(return_value=None)))
@@ -147,6 +149,54 @@ class CancellationAndRecoveryTests(unittest.IsolatedAsyncioTestCase):
         await bot.cancel_record(self.i, self.rec)
         self.assertEqual(bot.EVENTS["7"], [])
         self.assertIn("Cancelled", self.i.followup.send.await_args.args[0])
+
+    async def test_live_calendar_artwork_is_saved_before_event_deletion(self):
+        self.rec["vrc_file_id"] = None
+        self.get_event.return_value["imageId"] = "file_live"
+        async def deleted(*args):
+            self.assertEqual(self.rec["cancel_artwork_ids"], ["file_live"])
+            self.save.assert_called()
+            return True
+        self.delete_event.side_effect = deleted
+        await bot.cancel_record(self.i, self.rec)
+        self.delete_file.assert_awaited_once_with(
+            bot.vrc_cookies(self.conf), "file_live")
+        self.assertEqual(bot.EVENTS["7"], [])
+        self.assertIn("artwork file deleted", self.i.followup.send.await_args.args[0])
+
+    async def test_payload_artwork_is_cleaned_when_event_is_already_missing(self):
+        self.rec["vrc_file_id"] = None
+        self.rec["vrc_payload"] = {"imageId": "file_payload"}
+        self.rec["cancel_progress"] = {"vrchat": True, "images": True}
+        self.get_event.side_effect = bot.vrchat.VRChatError("Gone", 404)
+        self.delete_event.return_value = False
+        await bot.cancel_record(self.i, self.rec)
+        self.delete_file.assert_awaited_once_with(
+            bot.vrc_cookies(self.conf), "file_payload")
+        self.assertEqual(bot.EVENTS["7"], [])
+
+    async def test_failed_artwork_cleanup_retains_ids_and_retries_without_event_deletion(self):
+        self.get_event.return_value["imageId"] = "file_live"
+        self.rec["vrc_file_id"] = "file_live"
+        self.delete_file.side_effect = bot.vrchat.VRChatError("Deletion not confirmed", 200)
+        await bot.cancel_record(self.i, self.rec)
+        self.assertEqual(bot.EVENTS["7"], [self.rec])
+        self.assertEqual(self.rec["cancel_file_errors"]["file_live"]["http_status"], 200)
+        self.assertFalse(self.rec["cancel_progress"]["images"])
+        self.delete_file.side_effect = None
+        await bot.cancel_record(self.i, self.rec)
+        self.delete_event.assert_awaited_once()
+        self.get_event.assert_awaited_once()
+        self.assertEqual(bot.EVENTS["7"], [])
+
+    async def test_artwork_still_needed_by_another_booking_is_not_deleted(self):
+        self.rec["vrc_file_id"] = "file_shared"
+        other = dict(self.rec, event_id=22, vrc_event_id="cal_other")
+        bot.EVENTS["7"].append(other)
+        await bot.cancel_record(self.i, self.rec)
+        self.delete_file.assert_not_awaited()
+        self.assertIn(self.rec, bot.EVENTS["7"])
+        self.assertFalse(self.rec["cancel_progress"]["images"])
 
     async def test_calendar_with_unlinked_account_retains_cleanup(self):
         self.conf.clear()
