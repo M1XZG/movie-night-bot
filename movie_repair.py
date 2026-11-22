@@ -4,9 +4,9 @@ import asyncio
 import copy
 import datetime as dt
 import io
-import json
 import re
 import time
+from pathlib import Path
 from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
@@ -18,6 +18,11 @@ from ratings import MovieRatings, RatingsError, discord_announcement, discord_ev
 
 
 ACTIVE = set()
+
+
+def consistent_identity(text, imdb_id):
+    """A correct identifier does not excuse another film's identifier in the same copy."""
+    return set(re.findall(r"tt\d{7,12}(?!\d)", text)) <= {imdb_id}
 
 
 def interpret(problem, replacement):
@@ -58,7 +63,7 @@ class RepairSession:
 
     def records(self):
         return sorted((r for r in self.bot.EVENTS.get(str(self.guild_id), [])
-                       if r.get("unix", 0) > time.time()), key=lambda r: r["unix"])
+                       if r.get("unix", 0) > time.time() and not r.get("cancel_requested")), key=lambda r: r["unix"])
 
     def record(self):
         return next((r for r in self.records() if r["event_id"] == self.event_id), None)
@@ -115,6 +120,16 @@ class Picker(RepairView):
                 session.event_id = int(select.values[0])
                 if not session.record():
                     return await interaction.response.send_message("That booking is no longer upcoming.", ephemeral=True)
+                if session.record().get("repair_pending"):
+                    await interaction.response.defer(ephemeral=True, thinking=True)
+                    try:
+                        await restore_repair(session)
+                        await Confirm(session).show(interaction)
+                    except (art.BackdropError, OSError, ValueError, KeyError):
+                        await interaction.edit_original_response(
+                            content="The saved repair preview could not be restored. Review the booking before a new repair.",
+                            view=RepairShortcut(session, session.event_id))
+                    return
                 await interaction.response.send_modal(Problem(session))
 
             select.callback = choose
@@ -139,6 +154,15 @@ class RepairShortcut(RepairView):
         session = copy.copy(self.session)
         if not session.record():
             return await interaction.response.send_message("This booking is no longer upcoming.", ephemeral=True)
+        if session.record().get("repair_pending"):
+            await interaction.response.defer(ephemeral=True, thinking=True)
+            try:
+                await restore_repair(session)
+                await Confirm(session).show(interaction)
+            except (art.BackdropError, OSError, ValueError, KeyError):
+                await interaction.edit_original_response(
+                    content="The unfinished repair needs review; its saved image could not be restored.", view=None)
+            return
         await interaction.response.send_modal(Problem(session))
 
 
@@ -166,9 +190,10 @@ class Problem(discord.ui.Modal, title="Repair this booking"):
                 ephemeral=True)
         await interaction.response.defer(ephemeral=True, thinking=True)
         session.mode = mode
+        session.text_only = mode == "identity" and bool(re.search(r"\btext[\s-]+only\b", self.problem.value, re.I))
         session.existing = None
         session.upload_id = None
-        session.snapshot = rec.copy()
+        session.snapshot = copy.deepcopy(rec)
         session.missing_only = (mode == "artwork" and not session.attachment and
                                 bool(re.search(r"\b(missing|no|blank|absent)\b|not found", self.problem.value, re.I)))
         try:
@@ -191,6 +216,9 @@ class Problem(discord.ui.Modal, title="Repair this booking"):
                     await preview(interaction, session, None, [])
                     return
             query, year = search_text(self.problem.value, self.replacement.value, rec, mode)
+            if mode == "artwork" and not self.replacement.value.strip() and rec.get("imdb_id") and \
+                    rec.get("identity_provenance") in ("user_explicit", "tmdb_verified", "repair_tmdb_verified"):
+                query, year = rec["imdb_id"], None
             choices = await asyncio.to_thread(art.repair_candidates, query, year, rec.get("show_type", "movie"))
             if not choices:
                 raise art.BackdropError("No matching title. Try the official title or IMDb ID in the second field.")
@@ -218,7 +246,8 @@ class Titles(RepairView):
             try:
                 kind, identifier, _ = choices[int(select.values[0])]
                 details = await asyncio.to_thread(art.repair_details, kind, identifier)
-                covers = [] if session.attachment else await asyncio.to_thread(art.repair_artwork, kind, identifier)
+                covers = [] if session.attachment or session.text_only else \
+                    await asyncio.to_thread(art.repair_artwork, kind, identifier)
                 await preview(interaction, copy.copy(session), details, covers)
                 self.stop()
             except (art.BackdropError, discord.HTTPException, ValueError) as exc:
@@ -262,11 +291,7 @@ async def read_vrc(session, rec):
     if conf.get("group_id") != rec["vrc_group_id"] or not conf.get("auth_cookie"):
         raise ValueError("VRChat group or login changed; check the link before retrying.")
     cookies = session.bot.vrc_cookies(conf)
-    path = f"/calendar/{rec['vrc_group_id']}/{rec['vrc_event_id']}"
-    status, raw, _ = await asyncio.to_thread(vrchat._request, "GET", path, cookies=cookies)
-    if status != 200:
-        raise ValueError(f"VRChat calendar read returned HTTP {status}.")
-    event = json.loads(raw)
+    event = await vrchat.get_event(cookies, rec["vrc_group_id"], rec["vrc_event_id"])
     if event.get("id") != rec["vrc_event_id"]:
         raise ValueError("VRChat returned a different calendar event.")
     return cookies, event
@@ -301,12 +326,16 @@ async def preview(interaction, session, details, covers):
         await interaction.edit_original_response(content="Both checked covers are already in place. "
                                                 "For a replacement, describe it as a wrong cover.", view=None)
         return
-    if session.attachment:
+    if getattr(session, "text_only", False):
+        session.image = b""
+    elif session.attachment:
         image_path = await session.bot.fetch_backdrop(rec["title"], rec.get("year"), image=session.attachment)
-        session.image = image_path.read_bytes()
+        session.image = await asyncio.to_thread(session.bot.read_backdrop, image_path)
     elif getattr(session, "existing", None):
         session.image = art.validated_image(session.existing)
     else:
+        if not covers:
+            raise art.BackdropError("No replacement cover is available. Supply a landscape image.")
         session.image = await asyncio.to_thread(art.repair_cover, covers[0])
     if session.mode == "identity":
         title, year, imdb = details["title"], details["year"], details["imdb_id"]
@@ -327,14 +356,52 @@ async def preview(interaction, session, details, covers):
         label, emoji = session.bot.label_for(rec.get("show_type","movie"), when)
         session.name = f"{emoji} {label}: {title}"[:100]
         session.vname = f"{label}: {title}"[:64]
-        session.synopsis = (details["overview"] or f"{title} ({year})")[:900]
+        anchor = f"\nIMDb: https://www.imdb.com/title/{imdb}/"
+        session.synopsis = (details["overview"] or f"{title} ({year})")[:900-len(anchor)] + anchor
         session.description = discord_event_description(session.synopsis, runtime, ratings)
         body = session.bot.template_announcement(title, year, int(event.start_time.timestamp()), runtime, label, emoji)
         footer = f"\n\n:calendar_spiral: **Event:** https://discord.com/events/{session.guild_id}/{session.event_id}"
         session.post = discord_announcement(body, runtime, ratings, limit=2000-len(footer)) + footer
+        if not consistent_identity(session.description + session.synopsis + session.post, imdb):
+            raise ValueError("Replacement text contains conflicting IMDb identifiers. Choose another source.")
         session.runtime_note = (f"Film runtime: {duration} min; booking: {booked} min. Times will not move."
                                 if duration and booked and duration != booked else "")
     await Confirm(session).show(interaction)
+
+
+PLAN_FIELDS = ("mode", "text_only", "missing_only", "details", "targets", "name", "vname", "synopsis",
+               "description", "post", "runtime_note", "upload_id")
+
+
+async def restore_repair(session):
+    rec = session.record()
+    plan = copy.deepcopy(rec["repair_pending"])
+    for key in PLAN_FIELDS:
+        if key in plan:
+            setattr(session, key, plan[key])
+    session.image = b"" if getattr(session, "text_only", False) else \
+        await asyncio.to_thread(session.bot.read_backdrop, Path(plan["image_path"]))
+    session.booking = tuple(dt.datetime.fromisoformat(value) if value else None for value in plan["booking"])
+    session.covers, session.index = [], 0
+    session.snapshot = copy.deepcopy(rec)
+
+
+async def persist_plan(session, rec):
+    path = None if getattr(session, "text_only", False) else \
+        await asyncio.to_thread(art.manual_backdrop, session.image, session.bot.TMP_DIR)
+    plan = {key: copy.deepcopy(getattr(session, key)) for key in PLAN_FIELDS if hasattr(session, key)}
+    plan["image_path"] = str(path) if path else None
+    plan["booking"] = [value.isoformat() if value else None for value in session.booking]
+    previous = rec.get("repair_pending", {}).get("upload_id")
+    if previous and previous != plan.get("upload_id"):
+        retained = rec.setdefault("retained_vrc_files", [])
+        if previous not in retained:
+            retained.append(previous)
+    rec["repair_pending"] = plan
+    if path:
+        rec["backdrop_path"] = str(path)
+    session.bot.save_events(strict=True)
+    return plan
 
 
 class Confirm(RepairView):
@@ -352,7 +419,8 @@ class Confirm(RepairView):
         rec = s.snapshot
         d = s.details
         embed = discord.Embed(title=f"Repair: {rec['title']}"[:256], color=0x5865F2)
-        embed.description = ("Update title, synopsis, ratings and artwork." if s.mode == "identity" else
+        embed.description = ("Update title, synopsis and ratings; keep existing artwork." if getattr(s, "text_only", False) else
+                             "Update title, synopsis, ratings and artwork." if s.mode == "identity" else
                              "Update artwork only.") + "\n" + ", ".join(s.targets) + ".\nNo time changes or new pings."
         if d:
             identity = f"{d['title']} ({d['year']})"
@@ -363,9 +431,11 @@ class Confirm(RepairView):
             embed.add_field(name="New Discord description", value=s.description[:1024], inline=False)
             if s.runtime_note:
                 embed.add_field(name="Runtime", value=s.runtime_note)
-        embed.set_image(url="attachment://cover.jpg")
-        await interaction.edit_original_response(content="Nothing has changed yet.", embed=embed,
-            attachments=[discord.File(io.BytesIO(s.image), filename="cover.jpg")], view=self)
+        if s.image:
+            embed.set_image(url="attachment://cover.jpg")
+        content = "Resume the unfinished repair steps." if s.snapshot.get("repair_pending") else "Nothing has changed yet."
+        await interaction.edit_original_response(content=content, embed=embed,
+            attachments=[discord.File(io.BytesIO(s.image), filename="cover.jpg")] if s.image else [], view=self)
 
     async def cancel(self, interaction):
         if self.done:
@@ -403,14 +473,27 @@ class Confirm(RepairView):
                                                          view=None)
                 return
             notes, pending = [], []
+            plan = await persist_plan(s, rec)
             for target in list(s.targets):
                 try:
                     await apply_target(s, interaction.guild, rec, target)
+                    plan["targets"].remove(target)
+                    s.bot.save_events(strict=True)
                     notes.append(f"{target}: updated or already correct.")
-                except (ValueError, OSError, discord.HTTPException, vrchat.VRChatError) as exc:
+                except OSError:
+                    pending.append(target)
+                    pending.extend(t for t in s.targets[s.targets.index(target)+1:] if t not in pending)
+                    plan["targets"] = pending
+                    notes.append(f"{target}: booking state could not be saved; no further edits.")
+                    break
+                except (ValueError, discord.HTTPException, vrchat.VRChatError) as exc:
                     pending.append(target)
                     notes.append(f"{target}: {safe_error(exc)}")
-            s.targets, s.snapshot = pending, rec.copy()
+            plan["targets"] = pending
+            if not pending:
+                rec.pop("repair_pending", None)
+            s.bot.save_events(strict=True)
+            s.targets, s.snapshot = pending, copy.deepcopy(rec)
             retry = Confirm(s) if pending else None
             if retry:
                 retry.clear_items()
@@ -427,6 +510,9 @@ async def apply_target(s, guild, rec, target):
     if s.record() is not rec:
         raise ValueError("Booking is no longer available.")
     identity = s.mode == "identity"
+    text_only = getattr(s, "text_only", False)
+    if identity and not consistent_identity(s.description + s.synopsis + getattr(s, "post", ""), s.details["imdb_id"]):
+        raise ValueError("Replacement text contains conflicting IMDb identifiers.")
     if target == "Discord event":
         ev = await guild.fetch_scheduled_event(s.event_id)
         if (ev.status != discord.EventStatus.scheduled or ev.start_time.timestamp() <= time.time()
@@ -434,40 +520,64 @@ async def apply_target(s, guild, rec, target):
             raise ValueError("The booking time or status changed. Reopen the picker.")
         if not s.missing_only or not ev.cover_image:
             fields = dict(name=s.name, description=s.description) if identity else {}
-            updated = await ev.edit(image=s.image, **fields)
-            if not updated.cover_image or (identity and (updated.name != s.name or updated.description != s.description)):
+            if not text_only:
+                fields["image"] = s.image
+            updated = await ev.edit(**fields)
+            if (not text_only and not updated.cover_image) or (
+                identity and (updated.name != s.name or updated.description != s.description)):
                 raise ValueError("Discord did not confirm the event update.")
         if identity:
-            rec.update(title=s.details["title"], year=s.details["year"], imdb_id=s.details["imdb_id"])
+            rec.update(title=s.details["title"], year=s.details["year"], imdb_id=s.details["imdb_id"],
+                       identity_provenance="repair_tmdb_verified")
+            # An auth-expired calendar booking must recover the repaired identity, not the stale film.
+            if rec.get("vrc_payload") and not rec.get("vrc_event_id"):
+                rec["vrc_payload"].update(title=s.vname, description=s.synopsis)
             s.bot.save_events(strict=True)
     elif target == "VRChat event":
         cookies, ev = await read_vrc(s, rec)
         if s.missing_only and ev.get("imageId") and ev["imageId"] != getattr(s, "upload_id", None):
             return
-        if not getattr(s, "upload_id", None):
-            png = s.bot._to_vrchat_png(s.image)
+        if not text_only and not getattr(s, "upload_id", None):
+            png = await asyncio.to_thread(s.bot._to_vrchat_png, s.image)
             if not png:
                 raise ValueError("Couldn't convert the selected cover.")
             s.upload_id = await vrchat.upload_image(cookies, png, filename=f"movie-night-{s.event_id}.png")
-        fields = {"imageId": s.upload_id, "sendCreationNotification": False}
+            if rec.get("repair_pending") is not None:
+                rec["repair_pending"]["upload_id"] = s.upload_id
+                s.bot.save_events(strict=True)
+        fields = {"sendCreationNotification": False}
+        if not text_only:
+            fields["imageId"] = s.upload_id
         if identity:
             fields.update(title=s.vname, description=s.synopsis)
-        if ev.get("imageId") == s.upload_id and not identity:
+        if ev.get("imageId") == getattr(s, "upload_id", None) and not identity:
             updated = ev  # The previous write may have succeeded before its response was lost.
         else:
             updated = await vrchat.update_event(cookies, rec["vrc_group_id"], rec["vrc_event_id"], fields)
-        if updated.get("imageId") != s.upload_id:
+        if not text_only and updated.get("imageId") != s.upload_id:
             raise ValueError("VRChat did not confirm the new cover.")
         if identity and (updated.get("description") != s.synopsis or
                          vrchat._normalise_event_title(updated.get("title","").replace("˸",":"))
                          != vrchat._normalise_event_title(s.vname)):
             raise ValueError("VRChat did not confirm the updated film details.")
         previous = rec.get("vrc_file_id")
-        rec["vrc_file_id"] = s.upload_id
+        if not text_only:
+            rec["vrc_file_id"] = s.upload_id
+        if rec.get("vrc_payload"):
+            if not text_only:
+                rec["vrc_payload"].update(imageId=s.upload_id)
+            if identity:
+                rec["vrc_payload"].update(title=s.vname, description=s.synopsis)
         s.bot.save_events(strict=True)
-        if previous and previous != s.upload_id and previous == ev.get("imageId"):
+        if not text_only and previous and previous != s.upload_id and previous == ev.get("imageId"):
+            retained = rec.setdefault("retained_vrc_files", [])
+            if previous not in retained:
+                retained.append(previous)
+            s.bot.save_events(strict=True)
             try:
                 await vrchat.delete_file(cookies, previous)
+                retained.remove(previous)
+                s.bot.save_events(strict=True)
             except vrchat.VRChatError:
                 s.bot.log(f"Old repair cover could not be removed for event {s.event_id}.")
     else:
@@ -481,7 +591,16 @@ async def apply_target(s, guild, rec, target):
         if s.missing_only and len(keep) != len(msg.attachments):
             return
         fields = {"content": s.post} if identity else {}
-        updated = await msg.edit(attachments=[*keep, discord.File(io.BytesIO(s.image), filename="backdrop.jpg")],
-                                 allowed_mentions=discord.AllowedMentions.none(), **fields)
-        if not any(a.filename == "backdrop.jpg" for a in updated.attachments):
+        if text_only:
+            updated = await msg.edit(allowed_mentions=discord.AllowedMentions.none(), **fields)
+        else:
+            image = discord.File(io.BytesIO(s.image), filename="backdrop.jpg")
+            try:
+                updated = await msg.edit(attachments=[*keep, image],
+                                         allowed_mentions=discord.AllowedMentions.none(), **fields)
+            finally:
+                image.close()
+        if not text_only and not any(a.filename == "backdrop.jpg" for a in updated.attachments):
             raise ValueError("Discord did not confirm the announcement cover.")
+        if identity and updated.content != s.post:
+            raise ValueError("Discord did not confirm the announcement details.")

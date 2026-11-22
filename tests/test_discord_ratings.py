@@ -11,7 +11,8 @@ from ratings import MovieRatings, RatingsError
 class DiscordRatingsTests(unittest.IsolatedAsyncioTestCase):
     async def run_submission(self, *, lookup_error=False, announce_enabled=True, enriched=True,
                              backdrop_error=False, with_image=False, upload_error=False,
-                             imdb_id=None, title="The Matrix", year="1999", ratings_id="tt0133093"):
+                             imdb_id=None, title="The Matrix", year="1999", ratings_id="tt0133093",
+                             inferred_mismatch=False, conflicting_copy=False, ratings_api_key="testapikey"):
         voice = SimpleNamespace(id=11, mention="<#11>")
         announce = SimpleNamespace(id=12, mention="<#12>", send=AsyncMock(return_value=SimpleNamespace(id=99)))
         guild = SimpleNamespace(
@@ -36,15 +37,22 @@ class DiscordRatingsTests(unittest.IsolatedAsyncioTestCase):
             "announcement": "**Film:** The Matrix\n**Runtime:** about 2h 16m\n\nSynopsis.",
             "event_description": description,
         } if enriched else None
+        if conflicting_copy:
+            enrichment["event_description"] += " IMDb tt0468569 and old tt2098632."
         vrc_create = AsyncMock(return_value={"id": "cal-test"})
         record = Mock()
         log = Mock()
         with ExitStack() as stack:
-            stack.enter_context(patch.object(bot, "RATINGS_API_KEY", "testapikey"))
+            stack.enter_context(patch.object(bot, "RATINGS_API_KEY", ratings_api_key))
             image_path = Mock()
             image_path.read_bytes.return_value = b"jpeg-image"
             backdrop = AsyncMock(return_value=image_path if with_image else None)
-            if backdrop_error:
+            if inferred_mismatch:
+                backdrop.side_effect = [
+                    bot.BackdropIdentityError("Inferred identity mismatch"),
+                    BackdropError("No verified cover"),
+                ]
+            elif backdrop_error:
                 backdrop.side_effect = BackdropError("TMDB returned HTTP 401.")
             elif not with_image:
                 backdrop.side_effect = BackdropError("TMDB has no suitable landscape backdrop.")
@@ -65,7 +73,9 @@ class DiscordRatingsTests(unittest.IsolatedAsyncioTestCase):
             }))
             stack.enter_context(patch.object(bot, "vrc_cookies", return_value={}))
             stack.enter_context(patch.object(bot.vrchat, "create_event", vrc_create))
+            stack.enter_context(patch.object(bot.vrchat, "list_events", AsyncMock(return_value=[])))
             stack.enter_context(patch.object(bot, "add_event_record", record))
+            stack.enter_context(patch.object(bot, "save_events"))
             stack.enter_context(patch.object(bot, "log", log))
             calls = Mock()
             calls.attach_mock(lookup, "ratings")
@@ -77,7 +87,8 @@ class DiscordRatingsTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(lookup.call_args.kwargs["imdb_id"], imdb_id)
             expected_id = imdb_id or (None if lookup_error else ratings_id)
-            self.assertEqual(backdrop.await_args.kwargs["imdb_id"], expected_id)
+            self.assertEqual(backdrop.await_args_list[0].kwargs["imdb_id"], expected_id)
+            self.assertEqual(backdrop.await_args_list[0].kwargs["imdb_id_explicit"], bool(imdb_id))
         return guild, announce, vrc_create, interaction, record, log, description
 
     async def test_scores_are_in_discord_but_never_added_to_vrchat(self):
@@ -156,6 +167,26 @@ class DiscordRatingsTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("8.7/10", announce.send.await_args.kwargs["content"])
         self.assertIn("Ratings did not match", interaction.followup.send.await_args.args[0])
         self.assertEqual(record.call_args.args[1]["imdb_id"], "tt1234567")
+
+    async def test_inferred_imdb_mismatch_discards_scores_and_stale_identifier(self):
+        guild, announce, _, interaction, record, _, _ = await self.run_submission(inferred_mismatch=True)
+        self.assertIsNone(record.call_args.args[1]["imdb_id"])
+        self.assertNotIn("8.7/10", announce.send.await_args.kwargs["content"])
+        self.assertIn("IMDb: unavailable", guild.create_scheduled_event.await_args.kwargs["description"])
+        self.assertIn("inferred IMDb identity did not match", interaction.followup.send.await_args.args[0])
+
+    async def test_correct_and_wrong_imdb_ids_together_never_reach_discord_or_vrchat(self):
+        guild, announce, vrc, interaction, _, _, _ = await self.run_submission(
+            imdb_id="tt0468569", ratings_id="tt0468569", conflicting_copy=True)
+        discord_text = guild.create_scheduled_event.await_args.kwargs["description"] + announce.send.await_args.kwargs["content"]
+        self.assertNotIn("tt2098632", discord_text + vrc.await_args.args[2]["description"])
+        self.assertIn("Conflicting IMDb identifiers", interaction.followup.send.await_args.args[0])
+
+    async def test_missing_mdblist_key_does_not_short_circuit_independent_omdb_lookup(self):
+        with patch.object(bot, "load_api_key", side_effect=RatingsError("MDBList key missing")) as loader:
+            guild, _, _, _, _, _, _ = await self.run_submission(ratings_api_key=None)
+        loader.assert_not_called()
+        self.assertIn("IMDb: 8.7/10", guild.create_scheduled_event.await_args.kwargs["description"])
 
 
 if __name__ == "__main__":

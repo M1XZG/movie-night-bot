@@ -22,7 +22,11 @@ class RepairTests(unittest.IsolatedAsyncioTestCase):
                     CFG={"default_timezone":"UTC", "default_runtime_minutes":120},
                     gconf=lambda _: {"mod_channel_id":3}, save_events=Mock(),
                     RATINGS_API_KEY=None, OMDB_API_KEY=None, label_for=bot.label_for,
-                    template_announcement=bot.template_announcement, _to_vrchat_png=Mock(return_value=b"png"))
+                    template_announcement=bot.template_announcement, _to_vrchat_png=Mock(return_value=b"png"),
+                    TMP_DIR=bot.TMP_DIR, read_backdrop=Mock(return_value=b"cover"))
+        manual = patch.object(repair.art, "manual_backdrop", return_value=bot.TMP_DIR / "repair.jpg")
+        manual.start()
+        self.addCleanup(manual.stop)
         self.s = repair.RepairSession(self.b, self.i, None)
         self.s.event_id = 11
         self.s.snapshot = self.rec.copy()
@@ -83,7 +87,7 @@ class RepairTests(unittest.IsolatedAsyncioTestCase):
             await msg["view"].apply(self.i)
         self.assertEqual(set(self.ev.edit.await_args.kwargs), {"image","name","description"})
         self.assertEqual(vwrite.await_args.args[-1],{"imageId":"file-1","sendCreationNotification":False,
-                         "title":self.s.vname,"description":details["overview"]})
+                         "title":self.s.vname,"description":self.s.synopsis})
         self.assertEqual(self.rec["vrc_file_id"],"file-1")
         self.assertEqual(self.rec["imdb_id"],"tt0468569")
         self.assertIsNone(self.i.edit_original_response.await_args.kwargs["view"])
@@ -115,6 +119,19 @@ class RepairTests(unittest.IsolatedAsyncioTestCase):
         self.i.response.send_message.assert_awaited_once()
         self.i.guild.fetch_scheduled_event.assert_not_awaited()
 
+    async def test_failed_old_cover_cleanup_is_retained_for_cancellation(self):
+        self.s.mode, self.s.missing_only, self.s.image = "artwork", False, b"cover"
+        self.s.upload_id = "file-new"
+        self.rec["vrc_file_id"] = "file-old"
+        self.b.log = Mock()
+        with patch.object(repair, "read_vrc", AsyncMock(return_value=({}, {"imageId": "file-old"}))), \
+             patch.object(repair.vrchat, "update_event", AsyncMock(return_value={"imageId": "file-new"})), \
+             patch.object(repair.vrchat, "delete_file", AsyncMock(side_effect=repair.vrchat.VRChatError("failed"))):
+            await repair.apply_target(self.s, self.i.guild, self.rec, "VRChat event")
+        self.assertEqual(self.rec["vrc_file_id"], "file-new")
+        self.assertEqual(self.rec["retained_vrc_files"], ["file-old"])
+        self.b.save_events.assert_called()
+
     async def test_artwork_announcement_edits_in_place_without_mentions_or_content(self):
         self.s.mode,self.s.missing_only,self.s.image="artwork",False,b"jpg"
         self.b.client=NS(user=NS(id=4))
@@ -129,3 +146,103 @@ class RepairTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(fields["attachments"][0],keep)
         self.assertEqual(fields["allowed_mentions"].to_dict(),{"parse":[]})
         fields["attachments"][1].close()
+
+    async def test_unfinished_repair_survives_new_session_without_reupload(self):
+        self.s.mode, self.s.missing_only, self.s.image = "artwork", False, b"cover"
+        self.s.targets, self.s.covers = ["Discord event", "VRChat event"], []
+        self.s.details = {}
+        self.ev.edit.return_value = NS(cover_image=True)
+        upload = AsyncMock(return_value="file-repair")
+        with patch.object(repair, "read_vrc", AsyncMock(return_value=({}, {}))), \
+             patch.object(repair.vrchat, "upload_image", upload), \
+             patch.object(repair.vrchat, "update_event", AsyncMock(side_effect=[
+                 repair.vrchat.VRChatError("temporary"), {"imageId": "file-repair"}])):
+            await repair.Confirm(self.s).apply(self.i)
+            self.assertEqual(self.rec["repair_pending"]["targets"], ["VRChat event"])
+            self.assertEqual(self.rec["repair_pending"]["upload_id"], "file-repair")
+            resumed = repair.RepairSession(self.b, self.i, None)
+            resumed.event_id = 11
+            await repair.restore_repair(resumed)
+            await repair.Confirm(resumed).apply(self.i)
+        upload.assert_awaited_once()
+        self.ev.edit.assert_awaited_once()
+        self.assertNotIn("repair_pending", self.rec)
+
+    async def test_nested_record_changes_make_preview_stale(self):
+        import copy
+        self.rec["repair_pending"] = {"targets": ["VRChat event"]}
+        self.s.snapshot = copy.deepcopy(self.rec)
+        self.s.covers = []
+        self.rec["repair_pending"]["targets"].append("Discord event")
+        await repair.Confirm(self.s).apply(self.i)
+        self.i.response.send_message.assert_awaited_once()
+        self.ev.edit.assert_not_awaited()
+
+    async def test_cancellation_records_are_not_repairable(self):
+        self.rec["cancel_requested"] = True
+        self.assertEqual(self.s.records(), [])
+        self.assertIsNone(self.s.record())
+
+    async def test_identity_repair_corrects_pending_vrchat_backfill(self):
+        self.rec.pop("vrc_event_id")
+        self.rec["vrc_payload"] = {"title": "Wrong Film", "description": "Wrong synopsis"}
+        self.s.mode, self.s.missing_only, self.s.image = "identity", False, b"cover"
+        self.s.name, self.s.vname = "Movie Night: Correct", "Movie Night: Correct"
+        self.s.description, self.s.synopsis = "Correct Discord description", "Correct synopsis"
+        self.s.details = {"title": "Correct", "year": "2008", "imdb_id": "tt0468569"}
+        self.ev.edit.return_value = NS(cover_image=True, name=self.s.name, description=self.s.description)
+        await repair.apply_target(self.s, self.i.guild, self.rec, "Discord event")
+        self.assertEqual(self.rec["vrc_payload"], {"title": self.s.vname, "description": self.s.synopsis})
+
+    async def test_text_only_repair_preserves_both_covers_and_suppresses_notifications(self):
+        self.s.mode, self.s.missing_only, self.s.text_only = "identity", False, True
+        self.rec["vrc_file_id"] = "file-original"
+        self.s.snapshot = self.rec.copy()
+        details = dict(title="The Dark Knight", year="2008", imdb_id="tt0468569",
+                       runtime=152, people="Christopher Nolan", overview="Verified synopsis.")
+        self.ev.edit.side_effect = lambda **kwargs: NS(cover_image=True, **kwargs)
+        write = AsyncMock(side_effect=lambda cookies, group, event, fields: dict(fields))
+        upload, delete, cover = AsyncMock(), AsyncMock(), Mock()
+        with patch.object(repair, "read_vrc", AsyncMock(return_value=({}, {"imageId": "file-original"}))), \
+             patch.object(repair, "fetch_ratings", return_value=repair.MovieRatings()), \
+             patch.object(repair.vrchat, "update_event", write), \
+             patch.object(repair.vrchat, "upload_image", upload), \
+             patch.object(repair.vrchat, "delete_file", delete), \
+             patch.object(repair.art, "repair_cover", cover):
+            await repair.preview(self.i, self.s, details, [])
+            preview = self.i.edit_original_response.await_args.kwargs
+            self.assertEqual(preview["attachments"], [])
+            await preview["view"].apply(self.i)
+        self.assertEqual(set(self.ev.edit.await_args.kwargs), {"name", "description"})
+        self.assertEqual(set(write.await_args.args[-1]), {"title", "description", "sendCreationNotification"})
+        self.assertFalse(write.await_args.args[-1]["sendCreationNotification"])
+        self.assertEqual(self.rec["vrc_file_id"], "file-original")
+        upload.assert_not_awaited()
+        delete.assert_not_awaited()
+        cover.assert_not_called()
+        self.assertEqual((self.ev.start_time, self.ev.end_time), self.s.booking)
+        self.assertIn("tt0468569", self.s.description)
+        self.assertNotIn("tt2098632", self.s.description + self.s.synopsis)
+
+    async def test_correct_identifier_alongside_wrong_identifier_is_rejected(self):
+        self.assertFalse(repair.consistent_identity("IMDb tt0468569; old tt2098632", "tt0468569"))
+        self.s.mode, self.s.missing_only, self.s.image = "identity", False, b"cover"
+        self.s.details = {"imdb_id": "tt0468569"}
+        self.s.description = "Correct tt0468569; wrong tt2098632"
+        self.s.synopsis = "Correct tt0468569"
+        with self.assertRaisesRegex(ValueError, "conflicting IMDb"):
+            await repair.apply_target(self.s, self.i.guild, self.rec, "Discord event")
+        self.ev.edit.assert_not_awaited()
+
+    async def test_legacy_saved_imdb_is_not_used_as_an_explicit_artwork_pin(self):
+        for provenance, expected in ((None, "Bad label"), ("repair_tmdb_verified", "tt2098632")):
+            with self.subTest(provenance=provenance):
+                if provenance:
+                    self.rec["identity_provenance"] = provenance
+                else:
+                    self.rec.pop("identity_provenance", None)
+                modal = NS(session=self.s, problem=NS(value="Wrong poster"),
+                           replacement=NS(value=""))
+                with patch.object(repair.art, "repair_candidates", return_value=[]) as search:
+                    await repair.Problem.on_submit(modal, self.i)
+                self.assertEqual(search.call_args.args[0], expected)

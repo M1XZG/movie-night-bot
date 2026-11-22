@@ -1,3 +1,4 @@
+from email.utils import formatdate
 import json
 import os
 from pathlib import Path
@@ -15,6 +16,7 @@ def response(payload):
     result = MagicMock()
     result.__enter__.return_value = result
     result.read.return_value = json.dumps(payload).encode()
+    result.read1 = None
     return result
 
 
@@ -41,6 +43,22 @@ def replies(get, *, movie=None, search=None):
         response(SEARCH if search is None else search),
         response(MOVIE if movie is None else movie),
     ]
+
+
+def omdb_movie(**changes):
+    return {
+        "Response": "True", "Title": "The Matrix", "Year": "1999",
+        "Type": "movie", "imdbID": "tt0133093", "imdbRating": "8.7",
+        "Ratings": [], **changes,
+    }
+
+
+def omdb_search(*items, total=None):
+    return {
+        "Response": "True", "totalResults": str(len(items) if total is None else total),
+        "Search": [{key: item[key] for key in ("Title", "Year", "Type", "imdbID")}
+                   for item in items],
+    }
 
 
 class LookupTests(unittest.TestCase):
@@ -206,7 +224,7 @@ class LookupTests(unittest.TestCase):
 
     @patch("ratings.urlopen")
     def test_omdb_is_preferred_when_it_returns_verified_scores(self, get):
-        get.return_value = response({
+        data = {
             "Response": "True",
             "Title": "The Matrix",
             "Year": "1999",
@@ -217,7 +235,10 @@ class LookupTests(unittest.TestCase):
                 {"Source": "Internet Movie Database", "Value": "8.7/10"},
                 {"Source": "Rotten Tomatoes", "Value": "83%"},
             ],
-        })
+        }
+        get.side_effect = [response(data), response({
+            "Response": "True", "totalResults": "1", "Search": [data],
+        })]
 
         result = ratings.fetch_ratings(
             "The Matrix", "1999", "movie",
@@ -228,8 +249,8 @@ class LookupTests(unittest.TestCase):
             ratings.MovieRatings(
                 "8.7/10", "83%", "tt0133093", None, "OMDb"),
         )
-        self.assertEqual(get.call_count, 1)
-        query = parse_qs(urlsplit(get.call_args.args[0].full_url).query)
+        self.assertEqual(get.call_count, 2)
+        query = parse_qs(urlsplit(get.call_args_list[0].args[0].full_url).query)
         self.assertEqual(query["t"], ["The Matrix"])
         self.assertEqual(query["type"], ["movie"])
         self.assertIn(
@@ -348,6 +369,12 @@ class LookupTests(unittest.TestCase):
                 "Year": "2026–", "Type": "series", "imdbID": "tt39551330",
                 "imdbRating": "N/A", "Ratings": [],
             }),
+            response({
+                "Response": "True", "totalResults": "1", "Search": [{
+                    "Title": "Chainsmoker Cat", "Year": "2026–",
+                    "Type": "series", "imdbID": "tt39551330",
+                }],
+            }),
             response({"search": [], "total": 0}),
             response(series_search),
             response(series),
@@ -359,6 +386,228 @@ class LookupTests(unittest.TestCase):
 
         self.assertEqual(result.imdb, "6.9/10")
         self.assertIsNone(result.rotten_tomatoes)
+
+    @patch("ratings.urlopen")
+    def test_omdb_refuses_yearless_remakes_and_same_year_namesakes(self, get):
+        for year in (None, "1999"):
+            with self.subTest(year=year):
+                first = omdb_movie()
+                other = omdb_movie(imdbID="tt1111111", Year="2003" if year is None else "1999")
+                get.reset_mock()
+                get.side_effect = [response(first), response(omdb_search(first, other))]
+                with self.assertRaisesRegex(ratings.RatingsError, "unique title"):
+                    ratings._fetch_omdb_ratings("The Matrix", year, "movie", "key")
+                self.assertEqual(get.call_count, 2)
+
+    @patch("ratings.urlopen")
+    def test_omdb_checks_ambiguity_on_later_pages_and_rejects_repeated_pages(self, get):
+        first = omdb_movie()
+        rows = [first] + [omdb_movie(Title=f"Unrelated {n}", imdbID=f"tt{n:07d}") for n in range(1, 10)]
+        for final, message in (
+            (omdb_search(omdb_movie(imdbID="tt1111111"), total=11), "unique title"),
+            (omdb_search(*reversed(rows), total=11), "repeated"),
+            (omdb_search(omdb_movie(Title="Unrelated", imdbID="tt2222222"), total=12), "changed"),
+        ):
+            with self.subTest(message=message):
+                get.reset_mock()
+                get.side_effect = [response(first), response(omdb_search(*rows, total=11)), response(final)]
+                with self.assertRaisesRegex(ratings.RatingsError, message):
+                    ratings._fetch_omdb_ratings("The Matrix", "1999", "movie", "key")
+                self.assertEqual(get.call_count, 3)
+
+    @patch("ratings.urlopen")
+    def test_omdb_rejects_repeated_ids_even_when_page_contents_change(self, get):
+        first = omdb_movie()
+        rows = [first] + [omdb_movie(Title=f"Unrelated {n}", imdbID=f"tt{n:07d}") for n in range(1, 10)]
+        for repeated_id in (first["imdbID"], rows[1]["imdbID"]):
+            with self.subTest(repeated_id=repeated_id):
+                get.reset_mock()
+                last = omdb_movie(Title="Changed title on the next page", imdbID=repeated_id)
+                get.side_effect = [
+                    response(first), response(omdb_search(*rows, total=11)),
+                    response(omdb_search(last, total=11)),
+                ]
+                with self.assertRaisesRegex(ratings.RatingsError, "repeated a title identifier"):
+                    ratings._fetch_omdb_ratings("The Matrix", "1999", "movie", "key")
+                self.assertEqual(get.call_count, 3)
+        get.side_effect = [
+            response(first), response(omdb_search(*rows, total=11)),
+            response(omdb_search(omdb_movie(Title="Unrelated", imdbID="tt2222222"), total=11)),
+        ]
+        self.assertEqual(
+            ratings._fetch_omdb_ratings("The Matrix", "1999", "movie", "key").imdb_id,
+            first["imdbID"],
+        )
+
+    @patch("ratings.urlopen")
+    def test_omdb_incomplete_search_cannot_promote_an_identity(self, get):
+        first = omdb_movie()
+        for payload, message in (
+            (omdb_search(first, total=51), "incomplete"),
+            ({"Response": "True", "totalResults": 1, "Search": [first]}, "invalid search"),
+        ):
+            with self.subTest(message=message):
+                get.side_effect = [response(first), response(payload)]
+                with self.assertRaisesRegex(ratings.RatingsError, message):
+                    ratings._fetch_omdb_ratings("The Matrix", "1999", "movie", "key")
+
+    @patch("ratings.urlopen")
+    def test_omdb_bad_year_types_and_conflicting_scores_fail_safely(self, get):
+        for changed in (
+            {"Year": 1999}, {"Year": ["1999"]}, {"Year": "1999garbage"},
+            {"Ratings": [{"Source": "Internet Movie Database", "Value": "9.0/10"}]},
+            {"Ratings": [{"Source": "Rotten Tomatoes", "Value": "80%"},
+                         {"Source": "Rotten Tomatoes", "Value": "83%"}]},
+        ):
+            with self.subTest(changed=changed):
+                get.return_value = response(omdb_movie(**changed))
+                with self.assertRaises(ratings.RatingsError):
+                    ratings._fetch_omdb_ratings(
+                        "The Matrix", "1999", "movie", "key", "tt0133093")
+
+    @patch("ratings._fetch_mdblist_ratings", side_effect=ratings.RatingsError("MDBList unavailable"))
+    @patch("ratings.urlopen")
+    def test_verified_identity_survives_missing_scores_and_fallback_outage(self, get, mdblist):
+        data = omdb_movie(imdbRating="N/A")
+        get.side_effect = [response(data), response(omdb_search(data))]
+        result = ratings.fetch_ratings(
+            "The Matrix", "1999", api_key="key", omdb_api_key="key")
+        self.assertEqual(result.imdb_id, "tt0133093")
+        self.assertIsNone(result.imdb)
+        self.assertEqual(result.canonical_title, "The Matrix")
+        self.assertEqual(result.canonical_year, "1999")
+
+    @patch("ratings._fetch_mdblist_ratings")
+    @patch("ratings.urlopen")
+    def test_providers_cannot_silently_change_an_inferred_identity(self, get, mdblist):
+        data = omdb_movie(imdbRating="N/A")
+        get.side_effect = [response(data), response(omdb_search(data))]
+        mdblist.return_value = ratings.MovieRatings("9.0/10", imdb_id="tt1111111")
+        with self.assertRaisesRegex(ratings.RatingsError, "disagree"):
+            ratings.fetch_ratings("The Matrix", "1999", api_key="key", omdb_api_key="key")
+
+    @patch("ratings._fetch_mdblist_ratings", return_value=ratings.MovieRatings())
+    @patch("ratings.urlopen")
+    def test_missing_fallback_identity_does_not_erase_a_verified_omdb_identity(self, get, mdblist):
+        data = omdb_movie(imdbRating="N/A")
+        get.side_effect = [response(data), response(omdb_search(data))]
+        result = ratings.fetch_ratings("The Matrix", "1999", api_key="key", omdb_api_key="key")
+        self.assertEqual(result.imdb_id, "tt0133093")
+        self.assertEqual(result.canonical_year, "1999")
+
+    @patch("ratings.urlopen")
+    def test_omdb_accepts_only_the_confirmed_short_title_alias(self, get):
+        canonical = omdb_movie(
+            Title="Gremlins 2: The New Batch", Year="1990", imdbID="tt0099700", imdbRating="6.4")
+        get.side_effect = [response(canonical), response(omdb_search(canonical))]
+        result = ratings.fetch_ratings("Gremlins 2", "1990", api_key="key", omdb_api_key="key")
+        self.assertEqual(result.imdb_id, "tt0099700")
+        self.assertEqual(result.canonical_title, "Gremlins 2: The New Batch")
+
+    @patch("ratings.urlopen")
+    def test_known_abbreviated_title_uses_only_the_verified_canonical_alias(self, get):
+        canonical = "Gremlins 2: The New Batch"
+        get.side_effect = [
+            response({"search": [], "total": 0}),
+            response({"search": [{
+                "title": canonical, "year": 1990, "type": "movie",
+                "ids": {"imdb": "tt0099700"},
+            }], "total": 1}),
+            response({
+                "title": canonical, "year": 1990, "type": "movie",
+                "ids": {"imdb": "tt0099700"}, "ratings": [],
+            }),
+        ]
+        result = ratings.fetch_ratings("Gremlins 2", "1990", api_key="key")
+        self.assertEqual(result.imdb_id, "tt0099700")
+        self.assertEqual(result.canonical_title, canonical)
+        self.assertEqual(ratings._search_titles("Gremlins 2", "movie", "1991"), ["Gremlins 2"])
+        self.assertEqual(ratings._search_titles("Gremlins", "movie", "1984"), ["Gremlins"])
+
+    @patch("ratings.urlopen")
+    def test_conflicting_identifier_fields_are_rejected(self, get):
+        replies(get, movie={**MOVIE, "ids": {"imdb": "tt0133093", "imdbid": "tt1111111"}})
+        with self.assertRaisesRegex(ratings.RatingsError, "conflicting IMDb"):
+            self.lookup()
+
+    @patch("ratings.time.sleep")
+    @patch("ratings.urlopen")
+    def test_transient_provider_failures_retry_once_and_honor_retry_after(self, get, sleep):
+        for provider in ("OMDb", "MDBList"):
+            for failure in (HTTPError("", 429, "", {"Retry-After": "8"}, None),
+                            HTTPError("", 503, "", {}, None), URLError("private URL"),
+                            TimeoutError()):
+                with self.subTest(provider=provider, failure=type(failure).__name__):
+                    get.reset_mock()
+                    sleep.reset_mock()
+                    get.side_effect = [failure, response({"ok": True})]
+                    self.assertEqual(
+                        ratings._read_json(ratings.Request("https://example.test"), provider),
+                        {"ok": True},
+                    )
+                    self.assertEqual(get.call_count, 2)
+                    sleep.assert_called_once_with(
+                        8 if isinstance(failure, HTTPError) and failure.code == 429 else ratings.RETRY_DELAY)
+
+    @patch("ratings.time.sleep")
+    @patch("ratings.urlopen")
+    def test_retry_after_http_date_is_honored_without_capping_the_wait(self, get, sleep):
+        now = 1700000000
+        for provider in ("OMDb", "MDBList"):
+            with self.subTest(provider=provider):
+                get.reset_mock()
+                sleep.reset_mock()
+                get.side_effect = [
+                    HTTPError("", 429, "", {"Retry-After": formatdate(now + 8, usegmt=True)}, None),
+                    response({"ok": True}),
+                ]
+                with patch("ratings.time.time", return_value=now):
+                    self.assertEqual(
+                        ratings._read_json(ratings.Request("https://example.test"), provider),
+                        {"ok": True},
+                    )
+                sleep.assert_called_once_with(8)
+                self.assertEqual(get.call_count, 2)
+
+    @patch("ratings.time.sleep")
+    @patch("ratings.urlopen")
+    def test_retry_after_exceeding_the_budget_never_sleeps_or_retries_early(self, get, sleep):
+        now = 1700000000
+        for provider in ("OMDb", "MDBList"):
+            for header, budget in (
+                ("60", 45), (formatdate(now + 60, usegmt=True), 45),
+                ("1.5", 1), (None, 0.25),
+            ):
+                with self.subTest(provider=provider, header=header, budget=budget):
+                    get.reset_mock()
+                    sleep.reset_mock()
+                    headers = {} if header is None else {"Retry-After": header}
+                    get.side_effect = [HTTPError("", 429, "", headers, None), response({"ok": True})]
+                    with patch("ratings.time.time", return_value=now), \
+                            patch("ratings.time.monotonic", return_value=0):
+                        with ratings._lookup_deadline(budget):
+                            with self.assertRaisesRegex(ratings.RatingsError, "timed out"):
+                                ratings._read_json(ratings.Request("https://example.test"), provider)
+                    self.assertEqual(get.call_count, 1)
+                    sleep.assert_not_called()
+
+    @patch("ratings.time.sleep")
+    @patch("ratings.urlopen")
+    def test_exhausted_deadline_does_not_start_more_requests(self, get, sleep):
+        with ratings._lookup_deadline(0):
+            with self.assertRaisesRegex(ratings.RatingsError, "timed out"):
+                ratings._read_json(ratings.Request("https://example.test"), "OMDb")
+        get.assert_not_called()
+        sleep.assert_not_called()
+
+    def test_response_reader_stops_a_slow_stream_at_the_deadline(self):
+        reader = MagicMock()
+        reader.read1.return_value = b"x"
+        with patch("ratings.time.monotonic", side_effect=[0, 0, 0, 0, 2]):
+            with ratings._lookup_deadline(1):
+                with self.assertRaises(TimeoutError):
+                    ratings._read_response(reader, 100, 10)
+        reader.read1.assert_called_once()
 
     @patch("ratings.urlopen")
     def test_invalid_scores_and_conflicts_are_rejected(self, get):
@@ -401,8 +650,9 @@ class LookupTests(unittest.TestCase):
                 self.lookup()
             self.assertNotIn("testapikey", str(caught.exception))
 
+    @patch("ratings.time.sleep")
     @patch("ratings.urlopen")
-    def test_http_and_network_errors_do_not_leak_key(self, get):
+    def test_http_and_network_errors_do_not_leak_key(self, get, sleep):
         for error in (
             HTTPError("https://api.mdblist.com/?apikey=testapikey", 401, "bad key", {}, None),
             HTTPError("https://api.mdblist.com/?apikey=testapikey", 429, "limit", {}, None),

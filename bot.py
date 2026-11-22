@@ -21,10 +21,9 @@ Manage Events):
   /movie-config show    Show this guild's current configuration.
   /movie-config clear   Wipe this guild's configuration to start clean.
 
-Announcement and event content are enriched with AI: the bot shells out to the
-GitHub Copilot CLI (`copilot -p ... --silent`) to generate a whimsical post
-plus a synopsis and fun facts. If Copilot is unavailable it falls back to a
-plain template. Set use_copilot=false in config.json to disable.
+Film facts come from verified TMDB metadata. The optional GitHub Copilot CLI
+adds a generic invitation, never a film synopsis or ratings. Failed metadata
+lookups fall back to a plain template without invented facts.
 
 Per-guild config is stored in guilds.json keyed by guild id, so each server's
 mods configure their own channels, ping role and timezone.
@@ -35,9 +34,12 @@ Invite scopes: bot + applications.commands
 Gateway intents: guilds only (no privileged intents).
 """
 import asyncio
+import copy
 import datetime as dt
+import io
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -49,8 +51,9 @@ import discord
 from discord import app_commands
 
 import vrchat
-from movie_repair import Picker, RepairSession, RepairShortcut
-from find_backdrop import BackdropError, MAX_IMAGE_BYTES, manual_backdrop
+from movie_repair import ACTIVE, Picker, RepairSession, RepairShortcut
+from movie_repair import consistent_identity
+from find_backdrop import BackdropError, BackdropIdentityError, MAX_IMAGE_BYTES, manual_backdrop, validated_image
 from ratings import (
     IMDB_ID, MovieRatings, RatingsError, discord_announcement,
     discord_event_description, fetch_ratings, load_api_key,
@@ -113,21 +116,45 @@ GUILDS = load_json(GUILDS_FILE, {})
 # remove both the event and the announcement message:
 #   { guild_id: [ {event_id, message_id, channel_id, title, unix,
 #                  vrc_group_id?, vrc_event_id?}, ... ] }
-EVENTS = load_json(EVENTS_FILE, {})
+def load_events() -> dict:
+    if not EVENTS_FILE.exists():
+        return {}
+    # Losing this index loses the only safe way to cancel or recover partial writes.
+    data = json.loads(EVENTS_FILE.read_text())
+    if not isinstance(data, dict) or any(
+        not isinstance(records, list) or any(
+            not isinstance(record, dict)
+            or type(record.get("event_id")) is not int
+            or type(record.get("unix")) is not int
+            for record in records
+        ) for records in data.values()
+    ):
+        raise ValueError("Invalid events.json; restore the booking index before starting.")
+    return data
+
+
+EVENTS = load_events()
 # Per-guild VRChat linkage (chmod 600 — session cookies, never the password):
 #   { guild_id: {group_id, auth_cookie, twofa_cookie, display_name,
 #                category, access_type, send_notification, linked_by, linked_at} }
 VRC = load_json(VRC_FILE, {})
 
 
-def save_events(*, strict=False) -> None:
+def save_events(*, strict=True) -> None:
     temp = None
     try:
         with tempfile.NamedTemporaryFile(mode="w", dir=EVENTS_FILE.parent, delete=False) as f:
             temp = Path(f.name)
             json.dump(EVENTS, f, indent=2)
             f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
         temp.replace(EVENTS_FILE)
+        directory = os.open(EVENTS_FILE.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
     except OSError as e:
         log(f"WARN: could not write events.json: {e}")
         if strict:
@@ -138,24 +165,29 @@ def save_events(*, strict=False) -> None:
 
 
 def add_event_record(guild_id: int, rec: dict) -> None:
-    EVENTS.setdefault(str(guild_id), []).append(rec)
+    records = EVENTS.setdefault(str(guild_id), [])
+    if any(r.get("event_id") == rec["event_id"] for r in records):
+        raise ValueError("This Discord booking is already tracked.")
+    records.append(rec)
     save_events()
 
 
 def remove_event_record(guild_id: int, event_id: int) -> None:
     lst = EVENTS.get(str(guild_id), [])
     EVENTS[str(guild_id)] = [r for r in lst if r.get("event_id") != event_id]
-    save_events()
+    try:
+        save_events()
+    except OSError:
+        EVENTS[str(guild_id)] = lst
+        raise
 
 
 def upcoming_records(guild_id: int) -> list:
-    """Return this guild's records, pruning any whose showtime has passed."""
+    """Return recent bookings and unfinished cancellations without deleting history."""
     now = int(time.time())
     lst = EVENTS.get(str(guild_id), [])
-    kept = [r for r in lst if r.get("unix", 0) >= now - 6 * 3600]
-    if len(kept) != len(lst):
-        EVENTS[str(guild_id)] = kept
-        save_events()
+    kept = [r for r in lst if r.get("unix", 0) >= now - 6 * 3600
+            or r.get("cancel_requested")]
     return sorted(kept, key=lambda r: r.get("unix", 0))
 
 
@@ -168,7 +200,8 @@ def next_slot_prefill(guild_id: int, tz: "ZoneInfo",
     is advanced on the calendar (date + N days) so the suggested local start time
     is preserved across daylight-saving changes.
     """
-    recs = upcoming_records(guild_id)
+    recs = [r for r in upcoming_records(guild_id)
+            if not r.get("cancel_requested") and r.get("unix", 0) > time.time()]
     if not recs:
         return None, None
     last = dt.datetime.fromtimestamp(recs[-1].get("unix", 0), tz)
@@ -177,14 +210,27 @@ def next_slot_prefill(guild_id: int, tz: "ZoneInfo",
 
 
 def save_vrc() -> None:
+    temp = None
     try:
-        VRC_FILE.write_text(json.dumps(VRC, indent=2) + "\n")
+        with tempfile.NamedTemporaryFile(mode="w", dir=VRC_FILE.parent, delete=False) as f:
+            temp = Path(f.name)
+            os.fchmod(f.fileno(), 0o600)
+            json.dump(VRC, f, indent=2)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        temp.replace(VRC_FILE)
+        directory = os.open(VRC_FILE.parent, os.O_RDONLY | os.O_DIRECTORY)
         try:
-            os.chmod(VRC_FILE, 0o600)
-        except OSError:
-            pass
+            os.fsync(directory)
+        finally:
+            os.close(directory)
     except OSError as e:
         log(f"WARN: could not write vrchat.json: {e}")
+        raise
+    finally:
+        if temp:
+            temp.unlink(missing_ok=True)
 
 
 def vconf(guild_id: int) -> dict:
@@ -192,14 +238,24 @@ def vconf(guild_id: int) -> dict:
 
 
 def set_vconf(guild_id: int, data: dict) -> None:
+    previous = copy.deepcopy(VRC)
     VRC.setdefault(str(guild_id), {}).update(data)
-    save_vrc()
+    try:
+        save_vrc()
+    except OSError:
+        VRC.clear()
+        VRC.update(previous)
+        raise
 
 
 def clear_vconf(guild_id: int) -> bool:
     if str(guild_id) in VRC:
-        del VRC[str(guild_id)]
-        save_vrc()
+        previous = VRC.pop(str(guild_id))
+        try:
+            save_vrc()
+        except OSError:
+            VRC[str(guild_id)] = previous
+            raise
         return True
     return False
 
@@ -236,12 +292,14 @@ def clear_gconf(guild_id: int) -> bool:
 async def fetch_backdrop(title: str, year: str | None,
                          show_type: str = "movie",
                          image: discord.Attachment | None = None,
-                         *, imdb_id: str | None = None) -> Path:
+                         *, imdb_id: str | None = None, imdb_id_explicit: bool = True) -> Path:
     if image is not None:
         if image.size > MAX_IMAGE_BYTES:
             raise BackdropError("The manual backdrop must be smaller than 8 MB.")
         try:
-            data = await image.read()
+            data = await asyncio.wait_for(image.read(), timeout=30)
+        except asyncio.TimeoutError:
+            raise BackdropError("The manual backdrop download timed out.") from None
         except discord.HTTPException:
             raise BackdropError("The manual backdrop attachment could not be downloaded.") from None
         return await asyncio.to_thread(manual_backdrop, data, TMP_DIR)
@@ -250,7 +308,7 @@ async def fetch_backdrop(title: str, year: str | None,
         cmd.append(str(year))
     cmd.extend(["--show-type", show_type])
     if imdb_id:
-        cmd.extend(["--imdb-id", imdb_id])
+        cmd.extend(["--imdb-id" if imdb_id_explicit else "--inferred-imdb-id", imdb_id])
     env = dict(os.environ, MOVIE_BOT_TMP=str(TMP_DIR))
     proc = None
     try:
@@ -266,13 +324,18 @@ async def fetch_backdrop(title: str, year: str | None,
                 if line.startswith("ERROR: ")
             ]
             if reasons:
-                raise BackdropError(reasons[-1][:500])
+                error_type = BackdropIdentityError if b"ERROR_CODE: inferred_identity_mismatch" in err else BackdropError
+                raise error_type(reasons[-1][:500])
             raise BackdropError(
                 "TMDB backdrop lookup failed. Check bot.log or supply an image with `/movie schedule image:`."
             )
         path = (out or b"").decode().strip().splitlines()[-1] if out else "NONE"
-        if path and path != "NONE" and Path(path).exists():
-            return Path(path)
+        if path and path != "NONE":
+            result = Path(path).resolve()
+            if not result.is_relative_to(TMP_DIR.resolve()) or not result.is_file():
+                raise BackdropError("The backdrop helper returned an invalid image location.")
+            await asyncio.to_thread(read_backdrop, result)
+            return result
         raise BackdropError("The backdrop lookup did not produce an image.")
     except asyncio.TimeoutError:
         raise BackdropError("The backdrop lookup timed out; supply an image with `/movie schedule image:`.") from None
@@ -285,6 +348,15 @@ async def fetch_backdrop(title: str, year: str | None,
             except ProcessLookupError:
                 pass  # The child exited before the timeout cleanup.
             await proc.communicate()
+
+
+def read_backdrop(path: Path) -> bytes:
+    """Only reuse bounded, validated images in our managed cache."""
+    path = Path(path).resolve()
+    if not path.is_relative_to(TMP_DIR.resolve()):
+        raise BackdropError("The backdrop is outside the managed image cache.")
+    with path.open("rb") as source:
+        return validated_image(source.read(MAX_IMAGE_BYTES + 1))
 
 
 def _to_vrchat_png(img_bytes: bytes) -> bytes | None:
@@ -313,7 +385,7 @@ def _to_vrchat_png(img_bytes: bytes) -> bytes | None:
             out = io.BytesIO()
             im.convert("RGB").save(out, format="PNG")
             data = out.getvalue()
-        return data
+        return data if len(data) <= 9_500_000 else None
     except Exception as e:  # noqa: BLE001 - best-effort image path
         log(f"VRChat image conversion failed: {e}")
         return None
@@ -380,74 +452,77 @@ def find_copilot() -> str | None:
 
 async def enrich_with_copilot(title, year, unix, runtime_min,
                               show_type="movie", label="Movie Night",
-                              imdb_id: str | None = None) -> dict | None:
-    """Ask Copilot CLI for the announcement body AND a short event blurb.
+                              imdb_id: str | None = None, *, imdb_id_explicit: bool = True) -> dict | None:
+    """Use verified movie metadata for facts; ask Copilot only for a snack invitation."""
+    try:
+        from find_backdrop import find_title, load_credential, repair_details
 
-    Returns {"announcement": str, "event_description": str} or None on failure.
-    Text only, no tools. ``show_type`` adapts the research/wording; ``label`` is
-    the type/daypart-aware header (e.g. "Anime Matinée").
-    """
-    if not CFG.get("use_copilot", True):
+        def details():
+            kind, identifier = find_title(title, year, show_type, load_credential(), imdb_id,
+                                          imdb_id_explicit=imdb_id_explicit)
+            data = repair_details(kind, identifier)
+            if imdb_id and data.get("imdb_id") != imdb_id:
+                raise BackdropError("Movie metadata did not confirm the selected IMDb identifier.")
+            return data
+
+        metadata = await asyncio.to_thread(details)
+    except (BackdropError, ValueError, KeyError, TypeError):
+        log("Movie metadata unavailable; using the plain announcement without invented facts.")
         return None
+    display_title = title if show_type in ("tv", "anime") else metadata["title"]
+    body = template_announcement(display_title, metadata.get("year") or year, unix, runtime_min, label)
+    synopsis = metadata.get("overview") or ""
+    people = metadata.get("people") or ""
+    if synopsis:
+        body += "\n\n**What's it about?**\n" + synopsis[:800]
+    if people:
+        body += "\n\n:performing_arts: **People:** " + people[:250]
+    verified = {"announcement": body, "event_description": synopsis[:900], "metadata": metadata}
+    if not CFG.get("use_copilot", True):
+        return verified
     bin = find_copilot()
     if not bin:
-        return None
-    yr = f" ({year})" if year else ""
-    noun = SHOW_TYPE_NOUN.get(show_type, "film")
-    runtime_label = ("episode/season runtime" if show_type in ("tv", "anime")
-                     else "Runtime")
-    identity_note = (
-        f" Use IMDb title {imdb_id}; do not confuse it with other titles "
-        "with the same name." if imdb_id else ""
-    )
+        return verified
     prompt = (
-        "You are writing content for a Discord watch-party bot. Research the "
-        f"{noun} \"{title}\"{yr} from your own knowledge and produce fun, "
-        f"accurate content.{identity_note} Keep facts accurate; if unsure about a detail, omit "
-        "it. Do not invent a runtime if unknown. Do not include IMDb, Rotten "
-        "Tomatoes, or other review scores; the bot looks those up separately.\n\n"
-        "Output ONLY a JSON object (no markdown fences, no commentary) with "
-        "exactly these two string keys:\n\n"
-        "1. \"announcement\": a whimsical Discord announcement (max 1800 chars) "
-        "using :shortcode: emoji (NOT unicode) and this EXACT structure:\n"
-        f":clapper: **{label}: <TITLE>** <themed-emoji>\n\n"
-        "<one whimsical intro line>\n\n"
-        f"Join us at <t:{unix}:F> for **{title}**, <one-line premise>.\n\n"
-        f":clapper: **{'Series' if show_type in ('tv', 'anime') else 'Film'}:** <title and year>\n"
-        f":alarm_clock: **When:** <t:{unix}:F>\n"
-        ":performing_arts: **Starring:** <top 3-5 cast or voice cast>\n"
-        f":clapper: **{'Created by' if show_type in ('tv', 'anime') else 'Directed by'}:** <creator or director>\n"
-        f":hourglass_flowing_sand: **{runtime_label}:** about <Xh Ym>\n\n"
-        "**What's it about?**\n<short paragraph>\n\n"
-        "**Fun bits:**\n• <bullet>\n• <bullet>\n• <bullet>\n\n"
-        "<whimsical closing line>\n\n"
-        "2. \"event_description\": a plain-text blurb for the Discord scheduled "
-        "event (max 900 chars, NO emoji shortcodes, NO markdown headers): a "
-        "2-3 sentence synopsis, then a line 'Fun facts:' followed by 2-3 short "
-        "fun facts each on its own line prefixed with '- '."
+        "Write a whimsical, generic watch-party snack invitation. Do not research "
+        "a film or supply any facts, titles, names, dates, times, runtimes, links, "
+        "ratings, mentions or instructions. Use no tools. Output only JSON with "
+        "two short string keys: announcement (one invitation sentence, max 180 "
+        "characters) and event_description (one closing sentence, max 100 characters)."
     )
-    cmd = [bin, "-p", prompt, "--silent"]
+    cmd = [bin, "-p", prompt, "--silent", "--available-tools", "--no-custom-instructions"]
     # systemd's minimal PATH can resolve an old /usr/bin/node that breaks the
     # copilot loader. Ensure the bin dir holding *this* copilot (and its node)
     # is first on PATH for the subprocess.
     env = dict(os.environ)
     bin_dir = str(Path(bin).parent)
     env["PATH"] = bin_dir + os.pathsep + env.get("PATH", "/usr/bin:/bin")
+    proc = None
     try:
         proc = await asyncio.create_subprocess_exec(
             *cmd, stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE, cwd=str(Path.home()), env=env)
+            stderr=asyncio.subprocess.PIPE, cwd=str(HERE), env=env)
         out, err = await asyncio.wait_for(
             proc.communicate(), timeout=int(CFG.get("copilot_timeout", 120)))
         text = (out or b"").decode("utf-8", "replace").strip()
-        if err:
-            log(f"copilot stderr: {err.decode('utf-8','replace')[:300]}")
-        if not text:
-            return None
-        return _parse_enrichment(text)
-    except (asyncio.TimeoutError, OSError) as e:
-        log(f"copilot enrich failed: {e}")
-    return None
+        if proc.returncode or not text:
+            log(f"Copilot returned no usable invitation (exit_code={proc.returncode}); using the plain template.")
+            return verified
+        invitation = _parse_enrichment(text)
+        if not invitation:
+            return verified
+        verified["announcement"] += "\n\n" + invitation["announcement"][:180]
+        return verified
+    except (asyncio.TimeoutError, OSError, ValueError) as e:
+        log(f"copilot enrich failed ({type(e).__name__}); using the plain template.")
+    finally:
+        if proc is not None and proc.returncode is None:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            await proc.communicate()
+    return verified
 
 
 def _parse_enrichment(text: str) -> dict | None:
@@ -466,14 +541,19 @@ def _parse_enrichment(text: str) -> dict | None:
             s = s[i : j + 1]
     try:
         data = json.loads(s)
-    except (json.JSONDecodeError, ValueError) as e:
-        log(f"copilot enrich: JSON parse failed ({e}); using raw text as body")
-        return {"announcement": text.strip()[:1990], "event_description": ""}
-    ann = (data.get("announcement") or "").strip()
-    desc = (data.get("event_description") or "").strip()
-    if not ann:
+    except (json.JSONDecodeError, ValueError):
         return None
-    return {"announcement": ann[:1990], "event_description": desc[:900]}
+    if not isinstance(data, dict) or not all(
+        isinstance(data.get(key), str) for key in ("announcement", "event_description")
+    ):
+        return None
+    ann = data["announcement"].strip().replace("\u2014", ",")
+    desc = data["event_description"].strip().replace("\u2014", ",")
+    if not ann or len(ann) > 180 or len(desc) > 100 or re.search(r"\btt\d{7,12}\b", ann + desc) or any(
+        token in ann + desc for token in ("@", "http", "<t:", "\n")
+    ):
+        return None
+    return {"announcement": ann, "event_description": desc}
 
 
 def template_announcement(title, year, unix, runtime_min,
@@ -485,7 +565,7 @@ def template_announcement(title, year, unix, runtime_min,
         rt = f"\n:hourglass_flowing_sand: **Runtime:** about {h}h {m:02d}m"
     return (
         f":clapper: **{label}: {title}** :popcorn:\n\n"
-        f"Grab your snacks and a comfy seat — it's {label.lower()}!\n\n"
+        f"Grab your snacks and a comfy seat, it's {label.lower()}!\n\n"
         f"Join us at <t:{unix}:F> for **{title}**{yr}.\n\n"
         f":clapper: **Showing:** {title}{yr}\n"
         f":alarm_clock: **When:** <t:{unix}:F>"
@@ -511,7 +591,7 @@ class MovieModal(discord.ui.Modal, title="Schedule a Watch Party"):
                  image: discord.Attachment | None = None,
                  imdb_id: str | None = None):
         super().__init__(timeout=600)
-        self.conf = conf
+        self.conf = dict(conf)
         self.show_type = show_type if show_type in LABEL_MATRIX else "movie"
         self.make_vrchat = make_vrchat
         self.image = image
@@ -538,8 +618,34 @@ class MovieModal(discord.ui.Modal, title="Schedule a Watch Party"):
             self.add_item(item)
 
     async def on_submit(self, interaction: discord.Interaction):
-        global RATINGS_API_KEY, OMDB_API_KEY
+        if getattr(self, "_submitted", False):
+            await interaction.response.send_message(
+                "This scheduling request was already submitted. Check the booking before retrying.",
+                ephemeral=True)
+            return
+        self._submitted = True
         await interaction.response.defer(ephemeral=True, thinking=True)
+        started = time.monotonic()
+        outcome = "error"
+        try:
+            await MovieModal._schedule(self, interaction)
+            outcome = "returned"
+        except OSError:
+            await interaction.followup.send(
+                "⚠️ Booking state could not be saved. No further actions were attempted. "
+                "An event may already exist; don't schedule it again. Restore events.json "
+                "storage and check the existing booking before retrying.",
+                ephemeral=True)
+        except (discord.HTTPException, asyncio.TimeoutError):
+            await interaction.followup.send(
+                "⚠️ A Discord request failed. A booking may already exist; check it "
+                "before retrying. Any confirmed steps remain in events.json.",
+                ephemeral=True)
+        finally:
+            log(f"movie_request outcome={outcome} elapsed_seconds={time.monotonic() - started:.2f}")
+
+    async def _schedule(self, interaction: discord.Interaction):
+        global RATINGS_API_KEY, OMDB_API_KEY
         conf = self.conf
         tzname = conf.get("timezone", CFG["default_timezone"])
         try:
@@ -559,6 +665,18 @@ class MovieModal(discord.ui.Modal, title="Schedule a Watch Party"):
                 ephemeral=True)
             return
 
+        utc_start = start_dt.astimezone(dt.timezone.utc)
+        if utc_start.astimezone(tz).replace(tzinfo=None) != start_dt.replace(tzinfo=None):
+            await interaction.followup.send(
+                "⚠️ That local time does not exist because the clocks change. Choose another time.",
+                ephemeral=True)
+            return
+        if start_dt.utcoffset() != start_dt.replace(fold=1).utcoffset():
+            await interaction.followup.send(
+                "⚠️ That local time occurs twice when the clocks change. Choose a time outside that hour.",
+                ephemeral=True)
+            return
+
         if start_dt <= dt.datetime.now(tz):
             await interaction.followup.send(
                 "⚠️ That date/time is in the past. Pick a future showtime.",
@@ -570,19 +688,28 @@ class MovieModal(discord.ui.Modal, title="Schedule a Watch Party"):
             try:
                 runtime_min = int(self.runtime.value.strip())
             except ValueError:
-                runtime_min = None
-        if not runtime_min:
+                runtime_min = -1
+        if runtime_min is None:
             runtime_min = CFG.get("default_runtime_minutes", 120)
+        if type(runtime_min) is not int or not 1 <= runtime_min <= 1440:
+            await interaction.followup.send(
+                "⚠️ Runtime must be a whole number between 1 and 1440 minutes.",
+                ephemeral=True)
+            return
 
-        end_dt = start_dt + dt.timedelta(minutes=runtime_min)
+        end_dt = (utc_start + dt.timedelta(minutes=runtime_min)).astimezone(tz)
         unix = int(start_dt.timestamp())
         title = self.movie.value.strip()
         yr = self.year.value.strip() or None
+        if not title or (yr and (not yr.isdecimal() or not 1800 <= int(yr) <= 2200)):
+            await interaction.followup.send(
+                "⚠️ Enter a title and, if supplied, a four-digit release year.", ephemeral=True)
+            return
 
         guild = interaction.guild
         voice = guild.get_channel(conf["voice_channel_id"])
         announce = guild.get_channel(conf["announce_channel_id"])
-        if voice is None or announce is None:
+        if voice is None or (conf.get("announce_enabled", True) and announce is None):
             await interaction.followup.send(
                 "⚠️ Configured channels are missing. A mod should re-run "
                 "`/movie-config set`.", ephemeral=True)
@@ -593,8 +720,6 @@ class MovieModal(discord.ui.Modal, title="Schedule a Watch Party"):
 
         ratings = MovieRatings()
         try:
-            if RATINGS_API_KEY is None:
-                RATINGS_API_KEY = await asyncio.to_thread(load_api_key)
             ratings = await asyncio.to_thread(
                 fetch_ratings, title, yr, self.show_type,
                 api_key=RATINGS_API_KEY,
@@ -612,14 +737,36 @@ class MovieModal(discord.ui.Modal, title="Schedule a Watch Party"):
             log(f"WARN: movie ratings unavailable: {ratings_warning}")
             ratings_note = f"\n:warning: Ratings: {ratings_warning}"
         imdb_id = self.imdb_id or ratings.imdb_id
+        identity_verified = False
+        if imdb_id and not self.imdb_id and self.image is not None:
+            # Manual images bypass the helper, but must not bypass inferred-ID validation.
+            def validate_inferred():
+                from find_backdrop import find_title, load_credential
+                find_title(title, yr, self.show_type, load_credential(), imdb_id, imdb_id_explicit=False)
+            try:
+                await asyncio.to_thread(validate_inferred)
+                identity_verified = True
+            except BackdropError:
+                imdb_id, ratings = None, MovieRatings()
+                ratings_note += "\n:warning: The inferred IMDb identity could not be verified; identifier and scores omitted."
 
         image_note = ""
         img_path = None
         img_bytes = None
         try:
             img_path = await fetch_backdrop(
-                title, yr, self.show_type, self.image, imdb_id=imdb_id)
+                title, yr, self.show_type, self.image, imdb_id=imdb_id,
+                imdb_id_explicit=bool(self.imdb_id))
             img_bytes = img_path.read_bytes()
+            identity_verified = self.image is None or identity_verified
+        except BackdropIdentityError:
+            imdb_id, ratings = None, MovieRatings()
+            ratings_note += "\n:warning: The inferred IMDb identity did not match this title/year; identifier and scores omitted."
+            try:
+                img_path = await fetch_backdrop(title, yr, self.show_type, self.image)
+                img_bytes = img_path.read_bytes()
+            except (BackdropError, OSError):
+                image_note = "\n:warning: No verified event image was found. Supply a manual backdrop."
         except (BackdropError, OSError) as exc:
             warning = str(exc) if isinstance(exc, BackdropError) else "The downloaded backdrop could not be read."
             log(f"WARN: backdrop unavailable for '{title}': {warning}")
@@ -627,26 +774,62 @@ class MovieModal(discord.ui.Modal, title="Schedule a Watch Party"):
 
         # Generate rich content once (announcement body + event blurb).
         enriched = await enrich_with_copilot(
-            title, yr, unix, runtime_min, self.show_type, label, imdb_id=imdb_id)
+            title, yr, unix, runtime_min, self.show_type, label, imdb_id=imdb_id,
+            imdb_id_explicit=bool(self.imdb_id))
         if enriched:
             body = enriched["announcement"]
             event_desc = enriched.get("event_description") or ""
+            metadata = enriched.get("metadata")
+            if metadata:
+                canonical_id = metadata.get("imdb_id")
+                if canonical_id and IMDB_ID.fullmatch(canonical_id):
+                    if ratings.imdb_id and ratings.imdb_id != canonical_id:
+                        ratings = MovieRatings()
+                        ratings_note += "\n:warning: Ratings identity differed from verified metadata; scores omitted."
+                    imdb_id = canonical_id
+                    identity_verified = True
+                if self.show_type not in ("tv", "anime"):
+                    title = metadata["title"]
+                yr = metadata.get("year") or yr
+            if not consistent_identity(body + "\n" + event_desc, imdb_id):
+                body = template_announcement(title, yr, unix, runtime_min, label, emoji)
+                event_desc = ""
+                ratings_note += "\n:warning: Conflicting IMDb identifiers in generated text were discarded."
         else:
             body = template_announcement(
                 title, yr, unix, runtime_min, label, emoji)
             event_desc = ""
         if not event_desc:
-            event_desc = (f"{label} — {title}{f' ({yr})' if yr else ''}. "
+            event_desc = (f"{label}: {title}{f' ({yr})' if yr else ''}. "
                           "Grab snacks and join us!")
         event_desc = event_desc[:1000]
 
         discord_desc = discord_event_description(
             event_desc, runtime_min, ratings, announcement=body)
 
+        if utc_start <= dt.datetime.now(dt.timezone.utc):
+            await interaction.followup.send(
+                "⚠️ The showtime passed while preparing the booking. Choose a later time; no event was created.",
+                ephemeral=True)
+            return
+        vconf_g = dict(vconf(guild.id))
+        vrc_linked = bool(vconf_g.get("group_id"))
+        vrc_payload = None
+        if vrc_linked and self.make_vrchat:
+            early_min = max(0, min(60, int(vconf_g.get("early_start_minutes", 0) or 0)))
+            starts = (utc_start - dt.timedelta(minutes=early_min)).strftime("%Y-%m-%dT%H:%M:%SZ")
+            ends = end_dt.astimezone(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            vrc_payload = vrchat.build_event_payload(
+                f"{label}: {title}", event_desc, starts, ends,
+                category=vconf_g.get("category", "film_media"),
+                access_type=vconf_g.get("access_type", "group"),
+                send_notification=vconf_g.get("send_notification", True))
+        # Refuse external writes if the booking index cannot be persisted.
+        save_events(strict=True)
         # Create the scheduled event
         try:
             ev_kwargs = dict(
-                name=f"{emoji} {label}: {title}",
+                name=f"{emoji} {label}: {title}"[:100],
                 description=discord_desc,
                 start_time=start_dt,
                 end_time=end_dt,
@@ -681,8 +864,35 @@ class MovieModal(discord.ui.Modal, title="Schedule a Watch Party"):
             "year": yr,
             "show_type": self.show_type,
             "imdb_id": imdb_id,
+            "identity_provenance": ("user_explicit" if self.imdb_id else
+                                    "tmdb_verified" if imdb_id and identity_verified else
+                                    "ratings_inferred" if imdb_id else "unverified"),
             "unix": unix,
+            "announcement_state": "pending" if conf.get("announce_enabled", True) else "disabled",
+            "backdrop_path": str(img_path) if img_path else None,
+            "end_unix": int(end_dt.timestamp()),
         }
+        if vrc_payload is not None:
+            record.update(
+                vrc_group_id=vconf_g["group_id"], vrc_state="pending",
+                vrc_payload=vrc_payload)
+        # Save the Discord success before any independently failing operation.
+        add_event_record(guild.id, record)
+        key = guild.id, event.id
+        ACTIVE.add(key)
+        try:
+            await MovieModal._finish_schedule(
+                self, interaction, record, announce, body, runtime_min, ratings,
+                img_path, img_bytes, vconf_g, vrc_linked, event_url, ratings_note, image_note)
+        finally:
+            ACTIVE.discard(key)
+
+    async def _finish_schedule(self, interaction, record, announce, body, runtime_min, ratings,
+                               img_path, img_bytes, vconf_g, vrc_linked, event_url,
+                               ratings_note, image_note):
+        guild = interaction.guild
+        conf = self.conf
+        title, unix = record["title"], record["unix"]
 
         # Post the announcement, unless it's been toggled off for this server.
         announce_note = ""
@@ -703,109 +913,115 @@ class MovieModal(discord.ui.Modal, title="Schedule a Watch Party"):
                 body, runtime_min, ratings,
                 limit=2000 - len(prefix) - len(footer),
             ) + footer
+            record.update(channel_id=announce.id, announcement_state="sending")
+            save_events(strict=True)
             try:
                 kwargs = {"allowed_mentions": allowed}
                 if img_bytes:
-                    kwargs["file"] = discord.File(
-                        str(img_path), filename="backdrop.jpg")
+                    kwargs["file"] = discord.File(io.BytesIO(img_bytes), filename="backdrop.jpg")
                 msg = await announce.send(content=post, **kwargs)
                 record["message_id"] = msg.id
-                record["channel_id"] = announce.id
+                record["announcement_state"] = "posted"
                 announce_note = f" and announced it in {announce.mention}"
             except discord.Forbidden:
+                record["announcement_state"] = "failed"
                 announce_note = (f", but I couldn't post in {announce.mention} "
                                  "(missing Send Messages/Embed/Attach)")
+            except (discord.HTTPException, asyncio.TimeoutError, OSError):
+                record["announcement_state"] = "unknown"
+                announce_note = ", but the announcement result is uncertain; check the channel before retrying"
+            finally:
+                if kwargs.get("file"):
+                    kwargs["file"].close()
+            save_events(strict=True)
         else:
             announce_note = " (announcement skipped — disabled for this server)"
 
         # Optional: also create a VRChat group calendar event (best-effort).
         vrc_note = ""
-        vconf_g = vconf(guild.id)
-        vrc_linked = bool(vconf_g.get("group_id") and vconf_g.get("auth_cookie"))
         if vrc_linked and not self.make_vrchat:
             vrc_note = "\n:globe_with_meridians: VRChat event skipped (Discord-only watch party)."
         elif vrc_linked:
-            cookies = vrc_cookies(vconf_g)
-            # Optionally bring the VRChat event's start forward (end unchanged) so
-            # VRChat's own "event starting soon" announcement lands before the
-            # movie actually begins. End time is left at the real finish.
-            early_min = int(vconf_g.get("early_start_minutes", 0) or 0)
-            vrc_start_dt = start_dt - dt.timedelta(minutes=early_min)
-            starts = vrc_start_dt.astimezone(dt.timezone.utc).strftime(
-                "%Y-%m-%dT%H:%M:%SZ")
-            ends = end_dt.astimezone(dt.timezone.utc).strftime(
-                "%Y-%m-%dT%H:%M:%SZ")
-
-            # Upload the movie backdrop to the linked account (best-effort) so
-            # the event carries it instead of the group's banner.
-            vrc_image_id = None
-            vrc_image_warning = ""
-            if img_bytes:
-                png = _to_vrchat_png(img_bytes)
-                if png:
-                    try:
-                        vrc_image_id = await vrchat.upload_image(
-                            cookies, png, tag="gallery",
-                            filename=f"movie-night-{event.id}.png")
-                        log(f"VRChat image uploaded for guild {guild.id}: "
-                            f"{vrc_image_id}")
-                    except vrchat.VRChatAuthError:
-                        log(f"VRChat image upload: session expired (guild {guild.id})")
-                        vrc_image_warning = "VRChat image upload failed: session expired."
-                    except vrchat.VRChatError as e:
-                        log(f"VRChat image upload failed (guild {guild.id}): "
-                            f"{e.message}")
-                        vrc_image_warning = f"VRChat image upload failed: {e.message}"
-                else:
-                    vrc_image_warning = "The backdrop could not be converted for VRChat."
-
-            payload = vrchat.build_event_payload(
-                f"{label}: {title}", event_desc, starts, ends,
-                category=vconf_g.get("category", "film_media"),
-                access_type=vconf_g.get("access_type", "group"),
-                send_notification=vconf_g.get("send_notification", True),
-                image_id=vrc_image_id)
-            try:
-                ev = await vrchat.create_event(
-                    cookies, vconf_g["group_id"], payload)
-                cal_id = ev.get("id")
-                record["vrc_group_id"] = vconf_g["group_id"]
-                record["vrc_event_id"] = cal_id
-                if vrc_image_id:
-                    record["vrc_file_id"] = vrc_image_id
-                vrc_note = "\n:globe_with_meridians: Also posted to the VRChat group calendar."
-                if vrc_image_id:
-                    vrc_note += " (with the movie image)"
-                elif vrc_image_warning:
-                    vrc_note += f"\n:warning: {vrc_image_warning}"
-                log(f"VRChat event created for guild {guild.id}: {cal_id}")
-            except vrchat.VRChatAuthError:
-                vrc_note = ("\n:warning: VRChat session expired — run "
-                            "`/movie-vrchat link` to re-link. (Discord event still created.)")
-                log(f"VRChat auth expired for guild {guild.id}")
-                # Don't leave the just-uploaded image orphaned.
-                if vrc_image_id:
-                    try:
-                        await vrchat.delete_file(cookies, vrc_image_id)
-                    except vrchat.VRChatError:
-                        pass
-            except vrchat.VRChatError as e:
-                vrc_note = f"\n:warning: VRChat calendar event failed: {e.message}"
-                log(f"VRChat event failed for guild {guild.id}: {e.message}")
-                if vrc_image_id:
-                    try:
-                        await vrchat.delete_file(cookies, vrc_image_id)
-                    except vrchat.VRChatError:
-                        pass
-
-        add_event_record(guild.id, record)
+            vrc_note = "\n" + await create_record_vrc(record, vconf_g, img_bytes)
 
         await interaction.followup.send(
             f"✅ Scheduled **{title}** for <t:{unix}:F>, created the event"
             f"{announce_note}.\n{event_url}{vrc_note}{ratings_note}{image_note}",
-            ephemeral=True, view=RepairShortcut(RepairSession(sys.modules[__name__], interaction, None), event.id))
+            ephemeral=True, view=RepairShortcut(RepairSession(sys.modules[__name__], interaction, None), record["event_id"]))
         log(f"/movie schedule by {interaction.user} in guild {guild.id}: "
-            f"'{title}' @ {start_dt.isoformat()} event={event.id}")
+            f"'{title}' scheduled")
+
+
+async def create_record_vrc(record, conf, img_bytes=None, *, existing_ids=None):
+    """Persist intent and each confirmed side effect; never delete uncertain artwork."""
+    if record.get("vrc_event_id") or record.get("vrc_state") in ("creating", "unknown"):
+        return ":warning: This creation was already attempted. Reconcile it with `/movie-vrchat recover`."
+    if conf.get("group_id") != record.get("vrc_group_id") or not conf.get("auth_cookie"):
+        record["vrc_state"] = "failed"
+        save_events(strict=True)
+        return ":warning: VRChat login is missing. Re-link, then use `/movie-vrchat recover`."
+    cookies = vrc_cookies(conf)
+    try:
+        if existing_ids is None:
+            existing_ids = [event["id"] for event in await vrchat.list_events(cookies, record["vrc_group_id"])]
+    except vrchat.VRChatError as exc:
+        log(f"vrchat_stage=preflight error_type={type(exc).__name__} status={exc.status}")
+        record["vrc_state"] = "failed"
+        save_events(strict=True)
+        return ":warning: VRChat calendar could not be read; no creation was attempted. Check the link and recover later."
+    record["vrc_existing_ids"] = list(existing_ids)
+    save_events(strict=True)
+    warning = ""
+    if img_bytes and not record.get("vrc_file_id"):
+        png = await asyncio.to_thread(_to_vrchat_png, img_bytes)
+        if png:
+            try:
+                record["vrc_file_id"] = await vrchat.upload_image(
+                    cookies, png, tag="gallery", filename=f"movie-night-{record['event_id']}.png")
+                record["vrc_payload"]["imageId"] = record["vrc_file_id"]
+                save_events(strict=True)
+            except vrchat.VRChatAuthError as exc:
+                log(f"vrchat_stage=image_upload error_type={type(exc).__name__} status={exc.status}")
+                warning = "VRChat image upload failed: session expired."
+            except vrchat.VRChatError as exc:
+                log(f"vrchat_stage=image_upload error_type={type(exc).__name__} status={exc.status}")
+                warning = "VRChat image upload failed; check the linkage and connection."
+        else:
+            warning = "The backdrop could not be converted for VRChat."
+    record["vrc_state"] = "creating"
+    save_events(strict=True)
+    started = time.monotonic()
+    try:
+        event = await vrchat.create_event(cookies, record["vrc_group_id"], record["vrc_payload"],
+                                          existing_ids=record["vrc_existing_ids"])
+        if not isinstance(event, dict) or not isinstance(event.get("id"), str) or not event["id"]:
+            raise vrchat.VRChatWriteUncertainError(
+                "Calendar creation did not return an event identifier.",
+                existing_ids=record["vrc_existing_ids"])
+        record.update(vrc_event_id=event["id"], vrc_state="created")
+        result = ":globe_with_meridians: Also posted to the VRChat group calendar."
+        if record.get("vrc_file_id"):
+            result += " (with the movie image)"
+        elif warning:
+            result += "\n:warning: " + warning
+    except vrchat.VRChatAuthError:
+        record["vrc_state"] = "failed"
+        result = (":warning: VRChat session expired. Run `/movie-vrchat link`, then "
+                  "`/movie-vrchat recover`. The Discord booking is saved.")
+    except vrchat.VRChatWriteUncertainError as exc:
+        record.update(vrc_state="unknown", vrc_existing_ids=list(exc.existing_ids))
+        if exc.calendar_id:
+            record["vrc_event_id"] = exc.calendar_id
+        result = (":warning: VRChat creation is uncertain. The submitted request and cover are saved. "
+                  "Use `/movie-vrchat recover`; do not create another event.")
+    except (vrchat.VRChatError, asyncio.TimeoutError) as exc:
+        record["vrc_state"] = "unknown" if isinstance(exc, asyncio.TimeoutError) else "failed"
+        result = (":warning: VRChat calendar creation was not confirmed. Use "
+                  "`/movie-vrchat recover` to reconcile it before retrying. The uploaded cover is retained.")
+    save_events(strict=True)
+    log(f"vrchat_stage=calendar_create state={record['vrc_state']} "
+        f"elapsed_seconds={time.monotonic() - started:.2f}")
+    return result
 
 
 movie_group = app_commands.Group(
@@ -907,8 +1123,9 @@ async def movie_help(interaction: discord.Interaction):
         inline=False)
     embed.add_field(
         name="Repairs",
-        value="**/movie unfuck** — pick an upcoming booking, describe the problem and preview a repair. "
-              "Use **image:** for a custom cover. Nothing is changed until you press **Apply repair**.",
+        value="**/movie unfuck**: pick an upcoming booking, describe the problem and preview a repair. "
+              "Use **image:** for a custom cover, or describe a **text only** repair to keep both covers. "
+              "Reopen the picker to resume an unfinished repair. Nothing changes until **Apply repair**.",
         inline=False)
     embed.add_field(
         name="Configuration  ·  /movie-config",
@@ -924,6 +1141,7 @@ async def movie_help(interaction: discord.Interaction):
                "nights also post to its calendar.\n"
                "**status** — show the linked account/group and check the "
                "session.\n"
+               "**recover**: reconcile a saved unfinished booking after re-linking, without blindly reposting it.\n"
                "**unlink** — remove the VRChat link and stored session."),
         inline=False)
     embed.add_field(
@@ -1077,7 +1295,8 @@ async def _cancel_autocomplete(interaction: discord.Interaction, current: str):
     cur = current.lower()
     choices = []
     for r in recs:
-        when = dt.datetime.fromtimestamp(r.get("unix", 0)).strftime("%d %b %H:%M")
+        tz = ZoneInfo(gconf(interaction.guild_id).get("timezone") or CFG["default_timezone"])
+        when = dt.datetime.fromtimestamp(r.get("unix", 0), tz).strftime("%d %b %H:%M %Z")
         label = f"{r['title']} — {when}"[:100]
         if cur in label.lower():
             choices.append(app_commands.Choice(name=label, value=str(r["event_id"])))
@@ -1115,69 +1334,113 @@ async def movie_cancel(interaction: discord.Interaction, movie: str):
             "⚠️ I couldn't find that movie night (it may already be cancelled "
             "or finished).", ephemeral=True)
         return
+    key = interaction.guild_id, event_id
+    if key in ACTIVE:
+        await interaction.followup.send("This booking is already being changed. Wait for that operation.", ephemeral=True)
+        return
+    ACTIVE.add(key)
+    try:
+        await cancel_record(interaction, rec)
+    except OSError:
+        await interaction.followup.send(
+            "⚠️ Cancellation state could not be saved. No further deletions were attempted. "
+            "Keep this booking and retry once events.json storage is restored.", ephemeral=True)
+    finally:
+        ACTIVE.discard(key)
 
+
+async def cancel_record(interaction, rec):
     guild = interaction.guild
+    event_id = rec["event_id"]
     notes = []
+    rec["cancel_requested"] = True
+    progress = rec.setdefault("cancel_progress", {})
+    save_events(strict=True)
 
     # Delete the scheduled event
-    try:
-        event = guild.get_scheduled_event(event_id) or \
-            await guild.fetch_scheduled_event(event_id)
-        await event.delete()
-        notes.append("event deleted")
-    except discord.NotFound:
-        notes.append("event already gone")
-    except discord.Forbidden:
-        notes.append("⚠️ no permission to delete the event")
-    except discord.HTTPException as e:
-        notes.append(f"⚠️ event delete failed: {e}")
+    if not progress.get("event"):
+        try:
+            event = guild.get_scheduled_event(event_id) or await guild.fetch_scheduled_event(event_id)
+            await event.delete()
+            progress["event"] = True
+            notes.append("event deleted")
+        except discord.NotFound:
+            progress["event"] = True
+            notes.append("event already gone")
+        except (discord.HTTPException, asyncio.TimeoutError, OSError):
+            notes.append("⚠️ event deletion failed; retry cancellation")
+        save_events(strict=True)
 
     # Delete the announcement message
-    try:
-        ch = guild.get_channel(rec["channel_id"])
-        if ch:
-            msg = await ch.fetch_message(rec["message_id"])
-            await msg.delete()
-            notes.append("announcement deleted")
+    if not progress.get("announcement"):
+        if not rec.get("message_id"):
+            if rec.get("announcement_state") in ("sending", "unknown"):
+                notes.append("⚠️ announcement result is uncertain; locate its message before completing cancellation")
+            else:
+                progress["announcement"] = True
         else:
-            notes.append("announcement channel missing")
-    except discord.NotFound:
-        notes.append("announcement already gone")
-    except discord.Forbidden:
-        notes.append("⚠️ no permission to delete the announcement")
-    except discord.HTTPException as e:
-        notes.append(f"⚠️ announcement delete failed: {e}")
+            try:
+                ch = guild.get_channel(rec.get("channel_id"))
+                if not ch:
+                    raise ValueError("Announcement channel missing.")
+                msg = await ch.fetch_message(rec["message_id"])
+                await msg.delete()
+                progress["announcement"] = True
+                notes.append("announcement deleted")
+            except discord.NotFound:
+                progress["announcement"] = True
+                notes.append("announcement already gone")
+            except (ValueError, discord.HTTPException, asyncio.TimeoutError, OSError):
+                notes.append("⚠️ announcement deletion failed; retry cancellation")
+        save_events(strict=True)
 
     # Delete the linked VRChat calendar event, if any
-    if rec.get("vrc_event_id") and rec.get("vrc_group_id"):
-        vconf_g = vconf(interaction.guild_id)
-        if vconf_g.get("auth_cookie"):
-            cookies = vrc_cookies(vconf_g)
+    vconf_g = vconf(interaction.guild_id)
+    cookies = vrc_cookies(vconf_g)
+    if not progress.get("vrchat"):
+        if rec.get("vrc_event_id") and rec.get("vrc_group_id"):
             try:
+                if not vconf_g.get("auth_cookie") or vconf_g.get("group_id") != rec["vrc_group_id"]:
+                    raise ValueError("VRChat login or group changed.")
                 ok = await vrchat.delete_event(
                     cookies, rec["vrc_group_id"], rec["vrc_event_id"])
+                progress["vrchat"] = True
                 notes.append("VRChat event deleted" if ok
                              else "VRChat event already gone")
-            except vrchat.VRChatAuthError:
-                notes.append("⚠️ VRChat session expired (event not deleted)")
-            except vrchat.VRChatError as e:
-                notes.append(f"⚠️ VRChat delete failed: {e.message}")
-            # Also remove the uploaded image from the linked account.
-            if rec.get("vrc_file_id"):
-                try:
-                    ok = await vrchat.delete_file(cookies, rec["vrc_file_id"])
-                    notes.append("VRChat image deleted" if ok
-                                 else "VRChat image already gone")
-                except vrchat.VRChatAuthError:
-                    notes.append("⚠️ VRChat session expired (image not deleted)")
-                except vrchat.VRChatError as e:
-                    notes.append(f"⚠️ VRChat image delete failed: {e.message}")
+            except (ValueError, vrchat.VRChatError, asyncio.TimeoutError, OSError):
+                notes.append("⚠️ VRChat event not deleted; check the link and retry cancellation")
+        elif rec.get("vrc_state") in ("creating", "unknown"):
+            notes.append("⚠️ VRChat creation was uncertain; reconcile it with `/movie-vrchat recover` before deleting its image")
+        else:
+            progress["vrchat"] = True
+        save_events(strict=True)
 
-    remove_event_record(interaction.guild_id, event_id)
-    log(f"/movie-cancel by {interaction.user} in guild {guild.id}: "
-        f"'{rec['title']}' event={event_id} ({'; '.join(notes)})")
+    # A cover is safe to remove only once the calendar event is confirmed gone.
+    if not progress.get("images") and progress.get("vrchat"):
+        files = set(filter(None, (rec.get("vrc_file_id"), rec.get("repair_pending", {}).get("upload_id"),
+                                  *rec.get("retained_vrc_files", []))))
+        removed = rec.setdefault("cancelled_files", [])
+        for file_id in files.difference(removed):
+            try:
+                if not vconf_g.get("auth_cookie") or vconf_g.get("group_id") != rec.get("vrc_group_id"):
+                    raise ValueError("VRChat login or group changed.")
+                await vrchat.delete_file(cookies, file_id)
+                removed.append(file_id)
+            except (ValueError, vrchat.VRChatError, asyncio.TimeoutError, OSError):
+                notes.append("⚠️ VRChat image cleanup failed; retry cancellation")
+            save_events(strict=True)
+        progress["images"] = files.issubset(removed)
+        save_events(strict=True)
+
+    complete = all(progress.get(step) for step in ("event", "announcement", "vrchat", "images"))
+    if complete:
+        remove_event_record(interaction.guild_id, event_id)
+    log(f"/movie-cancel in guild {guild.id}: complete={complete}")
     await interaction.followup.send(
-        f"🗑️ Cancelled **{rec['title']}** — {', '.join(notes)}.", ephemeral=True)
+        f"{'🗑️ Cancelled' if complete else '⚠️ Cancellation incomplete for'} **{rec['title']}**. "
+        + ("; ".join(notes) or "Previously completed steps were not repeated.")
+        + ("" if complete else " The booking is retained so failed cleanup can be retried."),
+        ephemeral=True)
 
 
 config_group = app_commands.Group(
@@ -1308,22 +1571,29 @@ async def _store_vrc_session(interaction, group_id, category, auth, twofa):
             f"⚠️ Linked but couldn't confirm the session: {e.message}",
             ephemeral=True)
         return
-    set_vconf(interaction.guild_id, {
-        "group_id": group_id,
-        "auth_cookie": auth,
-        "twofa_cookie": twofa,
-        "display_name": me.get("displayName"),
-        "category": category,
-        "access_type": "group",
-        "send_notification": True,
-        "linked_by": interaction.user.id,
-        "linked_at": dt.datetime.now(dt.timezone.utc).isoformat(),
-    })
+    try:
+        set_vconf(interaction.guild_id, {
+            "group_id": group_id,
+            "auth_cookie": auth,
+            "twofa_cookie": twofa,
+            "display_name": me.get("displayName"),
+            "category": category,
+            "access_type": "group",
+            "send_notification": True,
+            "linked_by": interaction.user.id,
+            "linked_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        })
+    except OSError:
+        await interaction.followup.send(
+            "⚠️ The refreshed VRChat login could not be saved. The previous link is unchanged. "
+            "Restore state-file storage and re-link before recovering a booking.", ephemeral=True)
+        return
     log(f"/movie-vrchat link by {interaction.user} in guild "
         f"{interaction.guild_id}: {me.get('displayName')} -> {group_id}")
     await interaction.followup.send(
         f"✅ Linked VRChat account **{me.get('displayName')}** to group "
         f"`{group_id}`. Movie nights will now also post to its calendar.\n"
+        "For a previously missed calendar booking, run `/movie-vrchat recover` and pick it.\n"
         "_Only the session token was stored — never your password._",
         ephemeral=True)
 
@@ -1431,6 +1701,92 @@ vrc_group = app_commands.Group(
     name="movie-vrchat",
     description="Link a VRChat group so movie nights post to its calendar.",
     guild_only=True, default_permissions=discord.Permissions(manage_events=True))
+
+
+@vrc_group.command(name="recover", description="Recover a saved, unfinished VRChat calendar booking after re-linking.")
+@app_commands.describe(movie="Which saved movie booking to reconcile")
+@app_commands.autocomplete(movie=_cancel_autocomplete)
+async def vrc_recover(interaction: discord.Interaction, movie: str):
+    session = RepairSession(sys.modules[__name__], interaction, None)
+    if not await session.allowed(interaction):
+        return
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    try:
+        event_id = int(movie)
+    except ValueError:
+        return await interaction.followup.send("Pick a booking from the list.", ephemeral=True)
+    rec = next((r for r in EVENTS.get(str(interaction.guild_id), []) if r["event_id"] == event_id), None)
+    if not rec or not rec.get("vrc_payload"):
+        return await interaction.followup.send(
+            "No saved VRChat creation request for this booking. Older or Discord-only bookings "
+            "need a reviewed manual backfill; they won't be created automatically.", ephemeral=True)
+    key = interaction.guild_id, event_id
+    if key in ACTIVE:
+        return await interaction.followup.send("This booking is already being changed. Try again later.", ephemeral=True)
+    ACTIVE.add(key)
+    try:
+        note = await recover_record_vrc(interaction, rec)
+        await interaction.followup.send(note, ephemeral=True)
+    except OSError:
+        await interaction.followup.send(
+            "Booking state could not be saved; no further writes were attempted. Restore storage before retrying.",
+            ephemeral=True)
+    except (ValueError, discord.HTTPException, vrchat.VRChatError):
+        await interaction.followup.send(
+            "Recovery could not confirm the booking. Check the linked account/group and connection before retrying.",
+            ephemeral=True)
+    finally:
+        ACTIVE.discard(key)
+
+
+async def recover_record_vrc(interaction, rec):
+    conf = dict(vconf(interaction.guild_id))
+    if not conf.get("auth_cookie") or conf.get("group_id") != rec["vrc_group_id"]:
+        return "Re-link the original VRChat group before recovering this booking."
+    cookies = vrc_cookies(conf)
+    if rec.get("vrc_event_id"):
+        event = await vrchat.get_event(cookies, rec["vrc_group_id"], rec["vrc_event_id"])
+        if vrchat._event_problems(event, rec["vrc_payload"]):
+            return "The saved VRChat event needs manual review; its title, times or artwork differ from the saved request."
+        rec["vrc_state"] = "created"
+        save_events(strict=True)
+        return "The existing VRChat calendar event is confirmed. No new event or notification was created."
+    excluded = set(rec.get("vrc_existing_ids", []))
+    excluded.update(r["vrc_event_id"] for r in EVENTS.get(str(interaction.guild_id), [])
+                    if r is not rec and r.get("vrc_event_id"))
+    if rec.get("vrc_state") in ("creating", "unknown") and "vrc_existing_ids" in rec:
+        found = await vrchat.find_created_event(cookies, rec["vrc_group_id"], rec["vrc_payload"], list(excluded))
+        if found:
+            rec.update(vrc_event_id=found["id"], vrc_state="created")
+            save_events(strict=True)
+            return "Recovered the existing VRChat calendar event. No new event or notification was created."
+        return ("No unique matching event was confirmed. This calendar creation remains uncertain; "
+                "another event will not be posted. Review the calendar manually.")
+    events = await vrchat.list_events(cookies, rec["vrc_group_id"])
+    matches = [event for event in events if event["id"] not in excluded
+               and not vrchat._event_problems(event, rec["vrc_payload"])]
+    if len(matches) > 1:
+        return "Several VRChat calendar events match this request. Review them manually; no new event was posted."
+    if matches:
+        return ("A matching calendar event exists, but this request has no saved before-write baseline. "
+                "Review it manually rather than claiming or duplicating another event.")
+    if rec.get("cancel_requested") or rec.get("vrc_state") not in ("pending", "failed"):
+        return ("No unique matching VRChat event was confirmed. The previous creation result is uncertain, "
+                "so another calendar event will not be posted. Review the calendar manually.")
+    live = await interaction.guild.fetch_scheduled_event(rec["event_id"])
+    if live.status != discord.EventStatus.scheduled or live.start_time.timestamp() <= time.time():
+        return "This Discord booking is no longer upcoming; no VRChat event was created."
+    if live.start_time.timestamp() != rec["unix"] or (
+        rec.get("end_unix") and (not live.end_time or live.end_time.timestamp() != rec["end_unix"])
+    ):
+        return "The booking time changed. Review it before creating the missing VRChat event."
+    image = None
+    if not rec.get("vrc_file_id") and rec.get("backdrop_path"):
+        try:
+            image = await asyncio.to_thread(read_backdrop, Path(rec["backdrop_path"]))
+        except (BackdropError, OSError):
+            pass
+    return await create_record_vrc(rec, conf, image, existing_ids=[event["id"] for event in events])
 
 
 @vrc_group.command(name="link",
