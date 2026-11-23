@@ -13,13 +13,13 @@ Manage Events):
   /movie schedule                Opens a form (title / year / date / time / runtime),
                         then creates the event + posts the announcement.
                         Only works in the guild's configured mod channel.
-  /movie-cancel         Autocompletes upcoming movie nights; deletes the
+  /movie cancel         Autocompletes upcoming movie nights; deletes the
                         scheduled event AND the announcement message.
 
-  /movie-config set     Set this guild's mod_channel, announce_channel,
+  /movie config set     Set this guild's mod_channel, announce_channel,
                         voice_channel, ping_role and timezone (any subset).
-  /movie-config show    Show this guild's current configuration.
-  /movie-config clear   Wipe this guild's configuration to start clean.
+  /movie config show    Show this guild's current configuration.
+  /movie config clear   Wipe this guild's configuration to start clean.
 
 Film facts come from verified TMDB metadata. The optional GitHub Copilot CLI
 adds a generic invitation, never a film synopsis or ratings. Failed metadata
@@ -112,7 +112,7 @@ CFG = {**DEFAULTS, **load_json(CONFIG_FILE, {})}
 RATINGS_API_KEY = None
 OMDB_API_KEY = ""
 GUILDS = load_json(GUILDS_FILE, {})
-# Per-guild list of scheduled movie nights the bot created, so /movie-cancel can
+# Per-guild list of scheduled movie nights the bot created, so /movie cancel can
 # remove both the event and the announcement message:
 #   { guild_id: [ {event_id, message_id, channel_id, title, unix,
 #                  vrc_group_id?, vrc_event_id?}, ... ] }
@@ -712,7 +712,7 @@ class MovieModal(discord.ui.Modal, title="Schedule a Watch Party"):
         if voice is None or (conf.get("announce_enabled", True) and announce is None):
             await interaction.followup.send(
                 "⚠️ Configured channels are missing. A mod should re-run "
-                "`/movie-config set`.", ephemeral=True)
+                "`/movie config set`.", ephemeral=True)
             return
 
         # Type + daypart aware wording (e.g. "Anime Matinée", "Movie Night").
@@ -846,7 +846,7 @@ class MovieModal(discord.ui.Modal, title="Schedule a Watch Party"):
                 "the **Create Events** permission, plus **View Channel** and "
                 "**Connect** on "
                 f"{voice.mention if hasattr(voice, 'mention') else 'the voice channel'}. "
-                f"Run `/movie-test` to see what's missing.\n`{e.text or e}`",
+                f"Run `/movie test` to see what's missing.\n`{e.text or e}`",
                 ephemeral=True)
             return
         except discord.HTTPException as e:
@@ -955,11 +955,11 @@ class MovieModal(discord.ui.Modal, title="Schedule a Watch Party"):
 async def create_record_vrc(record, conf, img_bytes=None, *, existing_ids=None):
     """Persist intent and each confirmed side effect; never delete uncertain artwork."""
     if record.get("vrc_event_id") or record.get("vrc_state") in ("creating", "unknown"):
-        return ":warning: This creation was already attempted. Reconcile it with `/movie-vrchat recover`."
+        return ":warning: This creation was already attempted. Reconcile it with `/movie vrchat recover`."
     if conf.get("group_id") != record.get("vrc_group_id") or not conf.get("auth_cookie"):
         record["vrc_state"] = "failed"
         save_events(strict=True)
-        return ":warning: VRChat login is missing. Re-link, then use `/movie-vrchat recover`."
+        return ":warning: VRChat login is missing. Re-link, then use `/movie vrchat recover`."
     cookies = vrc_cookies(conf)
     try:
         if existing_ids is None:
@@ -1011,8 +1011,8 @@ async def create_record_vrc(record, conf, img_bytes=None, *, existing_ids=None):
     except vrchat.VRChatAuthError as exc:
         failure = {"stage": "calendar_create", "type": type(exc).__name__, "http_status": exc.status}
         record["vrc_state"] = "failed"
-        result = (":warning: VRChat session expired. Run `/movie-vrchat link`, then "
-                  "`/movie-vrchat recover`. The Discord booking is saved.")
+        result = (":warning: VRChat session expired. Run `/movie vrchat link`, then "
+                  "`/movie vrchat recover`. The Discord booking is saved.")
     except vrchat.VRChatWriteUncertainError as exc:
         failure = {
             "stage": "calendar_create", "type": type(exc).__name__,
@@ -1022,11 +1022,11 @@ async def create_record_vrc(record, conf, img_bytes=None, *, existing_ids=None):
         if exc.calendar_id:
             record["vrc_event_id"] = exc.calendar_id
             result = (":warning: VRChat created an event, but its fields need review. "
-                      "The event and cover are retained. Use `/movie-vrchat recover`; "
+                      "The event and cover are retained. Use `/movie vrchat recover`; "
                       "do not create another event.")
         else:
             result = (":warning: VRChat creation is uncertain. The submitted request and cover are saved. "
-                      "Use `/movie-vrchat recover`; do not create another event.")
+                      "Use `/movie vrchat recover`; do not create another event.")
     except (vrchat.VRChatError, asyncio.TimeoutError) as exc:
         failure = {
             "stage": "calendar_create", "type": type(exc).__name__,
@@ -1034,7 +1034,7 @@ async def create_record_vrc(record, conf, img_bytes=None, *, existing_ids=None):
         }
         record["vrc_state"] = "unknown" if isinstance(exc, asyncio.TimeoutError) else "failed"
         result = (":warning: VRChat calendar creation was not confirmed. Use "
-                  "`/movie-vrchat recover` to reconcile it before retrying. The uploaded cover is retained.")
+                  "`/movie vrchat recover` to reconcile it before retrying. The uploaded cover is retained.")
     if failure:
         record["vrc_last_error"] = failure
     else:
@@ -1046,7 +1046,7 @@ async def create_record_vrc(record, conf, img_bytes=None, *, existing_ids=None):
 
 
 movie_group = app_commands.Group(
-    name="movie", description="Schedule or repair this server's movie nights.",
+    name="movie", description="Schedule, manage and configure this server's movie nights.",
     guild_only=True, default_permissions=discord.Permissions(manage_events=True))
 
 
@@ -1080,7 +1080,7 @@ async def movie(interaction: discord.Interaction,
     if missing:
         await interaction.response.send_message(
             "⚠️ This server isn't configured yet. A mod must run "
-            "`/movie-config set` with a mod channel, announcements channel and "
+            "`/movie config set` with a mod channel, announcements channel and "
             "movie voice channel first.", ephemeral=True)
         return
     if interaction.channel_id != conf["mod_channel_id"]:
@@ -1112,70 +1112,56 @@ async def movie_unfuck(interaction: discord.Interaction, image: discord.Attachme
     await interaction.response.send_message("Which movie night needs fixing?", view=Picker(session), ephemeral=True)
 
 
-tree.add_command(movie_group)
-
-
-@tree.command(name="movie-help",
+@movie_group.command(name="help",
               description="List all movie-night commands and what they do.")
 @app_commands.guild_only()
 @app_commands.default_permissions(manage_events=True)
 async def movie_help(interaction: discord.Interaction):
     embed = discord.Embed(
-        title="🎬 Movie Night — command guide",
-        description="All commands need the **Manage Events** permission and are "
-                    "used in your server.",
+        title="🎬 Movie Night",
+        description="Use `/movie` to find every command. Requires **Manage Events**.",
         color=0x5865F2)
     embed.add_field(
-        name="Scheduling",
-        value=("**/movie schedule** — open a form (title, year, date, time, runtime) to "
-               "create a scheduled event + announcement. Pick a **type** "
-               "(Movie / TV Series / Anime / Other) and the wording adapts to "
-               "the show and time of day (e.g. *Anime Matinée*). Set "
-               "**vrchat:False** for a Discord-only watch party (skips the "
-               "VRChat event even when linked). *Only works in the configured "
-               "mod channel.* Use **image:** to attach a landscape backdrop "
-               "instead of looking it up on TMDB. Use **imdb:** to identify "
-               "a particular film or series when names overlap.\n"
-               "**/movie-test** — dry-run that checks config & permissions "
-               "without posting anything. Run this first.\n"
-               "**/movie-cancel** — pick an upcoming movie night to delete its "
-               "event **and** announcement (and the VRChat event if linked).\n"
-               "**/movie-help** — show this guide."),
+        name="Movie nights",
+        value=("`/movie schedule`: create an event and announcement from a form.\n"
+               "`/movie cancel`: remove a booking, its announcement and linked VRChat event.\n"
+               "`/movie unfuck`: preview and apply a film-details or artwork repair.\n"
+               "`/movie test`: check configuration and permissions without posting.\n"
+               "`/movie help`: show this guide."),
         inline=False)
     embed.add_field(
-        name="Repairs",
-        value="**/movie unfuck**: pick an upcoming booking, describe the problem and preview a repair. "
-              "Use **image:** for a custom cover, or describe a **text only** repair to keep both covers. "
-              "Reopen the picker to resume an unfinished repair. Nothing changes until **Apply repair**.",
+        name="Scheduling and repairs",
+        value=("Schedule and repair bookings in the configured **mod channel**.\n"
+               "Scheduling options: `type` selects the show type; `vrchat:False` skips VRChat; "
+               "`image` supplies a cover; `imdb` identifies an exact title.\n"
+               "Repairs: attach `image` for a custom cover, or request **text only** to keep covers. "
+               "Nothing changes until **Apply repair**. Reopen the picker to resume."),
         inline=False)
     embed.add_field(
-        name="Configuration  ·  /movie-config",
-        value=("**set** — set the mod channel, announcements channel, movie "
-               "voice channel, optional ping role, timezone, and the "
-               "`announcements` toggle (off = create the event only, no post).\n"
-               "**show** — show this server's current configuration.\n"
-               "**clear** — wipe the configuration to start fresh."),
+        name="Server configuration",
+        value=("`/movie config set`: set channels, ping role, timezone and announcements.\n"
+               "`/movie config show`: view current settings.\n"
+               "`/movie config clear`: reset settings; existing bookings stay."),
         inline=False)
     embed.add_field(
-        name="VRChat (optional)  ·  /movie-vrchat",
-        value=("**link** — link a VRChat account + group (one-time) so movie "
-               "nights also post to its calendar.\n"
-               "**status** — show the linked account/group and check the "
-               "session.\n"
-               "**recover**: reconcile a saved unfinished booking after re-linking, without blindly reposting it.\n"
-               "**unlink** — remove the VRChat link and stored session."),
+        name="VRChat (optional)",
+        value=("`/movie vrchat link`: link an account and group calendar.\n"
+               "`/movie vrchat status`: check the link and session.\n"
+               "`/movie vrchat early-start`: start events up to 60 minutes early.\n"
+               "`/movie vrchat recover`: reconcile an unfinished booking without blind reposts.\n"
+               "`/movie vrchat unlink`: remove the link and stored session."),
+        inline=False)
+    embed.add_field(
+        name="First-time setup",
+        value=("1. `/movie config set` your channels.\n"
+               "2. *(optional)* `/movie vrchat link` your VRChat group.\n"
+               "3. `/movie test` to confirm I have the access I need.\n"
+               "4. `/movie schedule` in the mod channel to schedule a night."),
         inline=False)
     embed.add_field(
         name="Image credits",
         value=("Backdrops: [TMDB](https://www.themoviedb.org).\n"
                "This product uses the TMDB API but is not endorsed or certified by TMDB."),
-        inline=False)
-    embed.add_field(
-        name="First-time setup",
-        value=("1. `/movie-config set` your channels.\n"
-               "2. *(optional)* `/movie-vrchat link` your VRChat group.\n"
-               "3. `/movie-test` to confirm I have the access I need.\n"
-               "4. `/movie schedule` in the mod channel to schedule a night."),
         inline=False)
     embed.set_thumbnail(url="attachment://tmdb-logo.png")
     await interaction.response.send_message(
@@ -1183,7 +1169,7 @@ async def movie_help(interaction: discord.Interaction):
         ephemeral=True)
 
 
-@tree.command(name="movie-test",
+@movie_group.command(name="test",
               description="Dry-run: check the bot's config & permissions without posting anything.")
 @app_commands.guild_only()
 @app_commands.default_permissions(manage_events=True)
@@ -1209,7 +1195,7 @@ async def movie_test(interaction: discord.Interaction):
     missing = [label for key, label in needed.items() if key not in conf]
     if missing:
         lines.append(mark(False, "Configuration: missing " + ", ".join(missing)
-                          + " — run `/movie-config set`."))
+                          + " — run `/movie config set`."))
         embed = discord.Embed(
             title="🎬 Movie Night — setup test",
             description="\n".join(lines), color=0xED4245)
@@ -1231,7 +1217,7 @@ async def movie_test(interaction: discord.Interaction):
         lines.append("ℹ️ Announcements are **off** — `/movie schedule` will create the "
                      "event (and VRChat event) but won't post a message.")
     if announce is None:
-        lines.append(mark(False, "Announcements channel not found (re-run `/movie-config set`)."))
+        lines.append(mark(False, "Announcements channel not found (re-run `/movie config set`)."))
     else:
         p = announce.permissions_for(me)
         sub = []
@@ -1254,7 +1240,7 @@ async def movie_test(interaction: discord.Interaction):
     # 4. Voice channel — view + connect (both needed to create a voice event)
     voice = guild.get_channel(conf["voice_channel_id"])
     if voice is None:
-        lines.append(mark(False, "Movie voice channel not found (re-run `/movie-config set`)."))
+        lines.append(mark(False, "Movie voice channel not found (re-run `/movie config set`)."))
     else:
         p = voice.permissions_for(me)
         vbad = [n for n, v in (("View Channel", p.view_channel),
@@ -1268,7 +1254,7 @@ async def movie_test(interaction: discord.Interaction):
     # 5. Mod channel — view (where /movie schedule is used)
     mod = guild.get_channel(conf["mod_channel_id"])
     if mod is None:
-        lines.append(mark(False, "Mod channel not found (re-run `/movie-config set`)."))
+        lines.append(mark(False, "Mod channel not found (re-run `/movie config set`)."))
     else:
         p = mod.permissions_for(me)
         lines.append(mark(p.view_channel,
@@ -1279,7 +1265,7 @@ async def movie_test(interaction: discord.Interaction):
     if conf.get("ping_role_id"):
         role = guild.get_role(conf["ping_role_id"])
         if role is None:
-            lines.append(mark(False, "Configured ping role no longer exists — update with `/movie-config set`."))
+            lines.append(mark(False, "Configured ping role no longer exists — update with `/movie config set`."))
         elif role.is_default():
             lines.append(mark(True, "Ping role: @everyone (handled specially)."))
         else:
@@ -1304,7 +1290,7 @@ async def movie_test(interaction: discord.Interaction):
         lines.append("\n**All required checks passed — you're ready to run `/movie schedule`.** 🎉")
         color = 0x57F287
     else:
-        lines.append("\n**Some checks failed.** Fix the ❌ items above, then run `/movie-test` again.")
+        lines.append("\n**Some checks failed.** Fix the ❌ items above, then run `/movie test` again.")
         color = 0xED4245
     embed = discord.Embed(title=title, description="\n".join(lines), color=color)
     embed.set_footer(text="This is a dry run — nothing was posted and no event was created.")
@@ -1324,7 +1310,7 @@ async def _cancel_autocomplete(interaction: discord.Interaction, current: str):
     return choices[:25]
 
 
-@tree.command(name="movie-cancel",
+@movie_group.command(name="cancel",
               description="Cancel a scheduled movie night (deletes the event + announcement).")
 @app_commands.guild_only()
 @app_commands.default_permissions(manage_events=True)
@@ -1337,7 +1323,7 @@ async def movie_cancel(interaction: discord.Interaction, movie: str):
         ch = interaction.guild.get_channel(conf["mod_channel_id"])
         where = ch.mention if ch else "the configured mod channel"
         await interaction.response.send_message(
-            f"⚠️ `/movie-cancel` can only be used in {where}.", ephemeral=True)
+            f"⚠️ `/movie cancel` can only be used in {where}.", ephemeral=True)
         return
 
     await interaction.response.defer(ephemeral=True, thinking=True)
@@ -1454,7 +1440,7 @@ async def cancel_record(interaction, rec):
             except (ValueError, vrchat.VRChatError, asyncio.TimeoutError, OSError):
                 notes.append("⚠️ VRChat event not deleted; check the link and retry cancellation")
         elif rec.get("vrc_state") in ("creating", "unknown"):
-            notes.append("⚠️ VRChat creation was uncertain; reconcile it with `/movie-vrchat recover` before deleting its image")
+            notes.append("⚠️ VRChat creation was uncertain; reconcile it with `/movie vrchat recover` before deleting its image")
         else:
             progress["vrchat"] = True
         save_events(strict=True)
@@ -1501,7 +1487,7 @@ async def cancel_record(interaction, rec):
     complete = all(progress.get(step) for step in ("event", "announcement", "vrchat", "images"))
     if complete:
         remove_event_record(interaction.guild_id, event_id)
-    log(f"/movie-cancel in guild {guild.id}: complete={complete}")
+    log(f"/movie cancel in guild {guild.id}: complete={complete}")
     await interaction.followup.send(
         f"{'🗑️ Cancelled' if complete else '⚠️ Cancellation incomplete for'} **{rec['title']}**. "
         + ("; ".join(notes) or "Previously completed steps were not repeated.")
@@ -1510,8 +1496,8 @@ async def cancel_record(interaction, rec):
 
 
 config_group = app_commands.Group(
-    name="movie-config", description="Configure the movie-night bot for this server.",
-    guild_only=True, default_permissions=discord.Permissions(manage_events=True))
+    name="config", description="Configure the movie-night bot for this server.",
+    parent=movie_group)
 
 
 @config_group.command(name="set", description="Set this server's channels, timezone and options.")
@@ -1553,7 +1539,7 @@ async def config_set(
         ping_role_id=ping_role.id if ping_role else None,
         timezone=timezone,
         announce_enabled=announcements)
-    log(f"/movie-config set by {interaction.user} in guild "
+    log(f"/movie config set by {interaction.user} in guild "
         f"{interaction.guild_id}: {conf}")
     await interaction.response.send_message(
         "✅ Saved. Current config:\n" + _format_conf(interaction.guild, conf),
@@ -1565,7 +1551,7 @@ async def config_show(interaction: discord.Interaction):
     conf = gconf(interaction.guild_id)
     if not conf:
         await interaction.response.send_message(
-            "No configuration yet. Run `/movie-config set`.", ephemeral=True)
+            "No configuration yet. Run `/movie config set`.", ephemeral=True)
         return
     await interaction.response.send_message(
         _format_conf(interaction.guild, conf), ephemeral=True)
@@ -1575,14 +1561,14 @@ async def config_show(interaction: discord.Interaction):
                       description="Wipe this server's movie-bot config to start clean.")
 async def config_clear(interaction: discord.Interaction):
     cleared = clear_gconf(interaction.guild_id)
-    log(f"/movie-config clear by {interaction.user} in guild "
+    log(f"/movie config clear by {interaction.user} in guild "
         f"{interaction.guild_id}: cleared={cleared}")
     if cleared:
         await interaction.response.send_message(
             "🧹 Config cleared. The bot is now unconfigured for this server — "
-            "run `/movie-config set` to set it up again.\n"
+            "run `/movie config set` to set it up again.\n"
             "_(Scheduled events and announcements already posted are untouched; "
-            "use `/movie-cancel` for those.)_", ephemeral=True)
+            "use `/movie cancel` for those.)_", ephemeral=True)
     else:
         await interaction.response.send_message(
             "Nothing to clear — this server has no saved config.", ephemeral=True)
@@ -1609,11 +1595,8 @@ def _format_conf(guild: discord.Guild, conf: dict) -> str:
         f"• **Timezone:** `{conf.get('timezone', CFG['default_timezone'])}`")
 
 
-tree.add_command(config_group)
-
-
 # --------------------------------------------------------------------------- #
-# VRChat group-calendar linking (/movie-vrchat)
+# VRChat group-calendar linking (/movie vrchat)
 # --------------------------------------------------------------------------- #
 # In-memory pending logins between the credentials modal and the 2FA modal.
 # Keyed by (guild_id, user_id) -> {auth, methods, group_id, category, expires}.
@@ -1654,12 +1637,12 @@ async def _store_vrc_session(interaction, group_id, category, auth, twofa):
             "⚠️ The refreshed VRChat login could not be saved. The previous link is unchanged. "
             "Restore state-file storage and re-link before recovering a booking.", ephemeral=True)
         return
-    log(f"/movie-vrchat link by {interaction.user} in guild "
+    log(f"/movie vrchat link by {interaction.user} in guild "
         f"{interaction.guild_id}: {me.get('displayName')} -> {group_id}")
     await interaction.followup.send(
         f"✅ Linked VRChat account **{me.get('displayName')}** to group "
         f"`{group_id}`. Movie nights will now also post to its calendar.\n"
-        "For a previously missed calendar booking, run `/movie-vrchat recover` and pick it.\n"
+        "For a previously missed calendar booking, run `/movie vrchat recover` and pick it.\n"
         "_Only the session token was stored — never your password._",
         ephemeral=True)
 
@@ -1679,7 +1662,7 @@ class VRC2FAModal(discord.ui.Modal, title="VRChat 2FA"):
         pending = PENDING_VRC.get(self.pending_key)
         if not pending:
             await interaction.followup.send(
-                "⚠️ That login attempt expired. Run `/movie-vrchat link` again.",
+                "⚠️ That login attempt expired. Run `/movie vrchat link` again.",
                 ephemeral=True)
             return
         method = pending["methods"][0]
@@ -1764,9 +1747,9 @@ class VRCLinkModal(discord.ui.Modal, title="Link VRChat account"):
 
 
 vrc_group = app_commands.Group(
-    name="movie-vrchat",
+    name="vrchat",
     description="Link a VRChat group so movie nights post to its calendar.",
-    guild_only=True, default_permissions=discord.Permissions(manage_events=True))
+    parent=movie_group)
 
 
 @vrc_group.command(name="recover", description="Recover a saved, unfinished VRChat calendar booking after re-linking.")
@@ -1867,7 +1850,7 @@ async def vrc_status(interaction: discord.Interaction):
     conf = vconf(interaction.guild_id)
     if not conf.get("group_id"):
         await interaction.response.send_message(
-            "No VRChat group linked. Run `/movie-vrchat link`.", ephemeral=True)
+            "No VRChat group linked. Run `/movie vrchat link`.", ephemeral=True)
         return
     await interaction.response.defer(ephemeral=True, thinking=True)
     valid = "unknown"
@@ -1875,7 +1858,7 @@ async def vrc_status(interaction: discord.Interaction):
         me = await vrchat.current_user(vrc_cookies(conf))
         valid = f"✅ active (as **{me.get('displayName')}**)"
     except vrchat.VRChatAuthError:
-        valid = "⚠️ expired — run `/movie-vrchat link` to refresh"
+        valid = "⚠️ expired — run `/movie vrchat link` to refresh"
     except vrchat.VRChatError as e:
         valid = f"⚠️ check failed: {e.message}"
     early = int(conf.get("early_start_minutes", 0) or 0)
@@ -1892,7 +1875,7 @@ async def vrc_status(interaction: discord.Interaction):
                    description="Remove this server's VRChat link and stored session.")
 async def vrc_unlink(interaction: discord.Interaction):
     cleared = clear_vconf(interaction.guild_id)
-    log(f"/movie-vrchat unlink by {interaction.user} in guild "
+    log(f"/movie vrchat unlink by {interaction.user} in guild "
         f"{interaction.guild_id}: cleared={cleared}")
     await interaction.response.send_message(
         "🧹 VRChat link removed and stored session deleted." if cleared
@@ -1907,11 +1890,11 @@ async def vrc_unlink(interaction: discord.Interaction):
 async def vrc_early_start(interaction: discord.Interaction, minutes: int):
     if not vconf(interaction.guild_id).get("group_id"):
         await interaction.response.send_message(
-            "No VRChat group linked. Run `/movie-vrchat link` first.", ephemeral=True)
+            "No VRChat group linked. Run `/movie vrchat link` first.", ephemeral=True)
         return
     minutes = max(0, min(60, minutes))
     set_vconf(interaction.guild_id, {"early_start_minutes": minutes})
-    log(f"/movie-vrchat early-start by {interaction.user} in guild "
+    log(f"/movie vrchat early-start by {interaction.user} in guild "
         f"{interaction.guild_id}: {minutes} min")
     if minutes:
         msg = (f"⏪ VRChat events will now start **{minutes} min early** so VRChat's "
@@ -1922,7 +1905,7 @@ async def vrc_early_start(interaction: discord.Interaction, minutes: int):
     await interaction.response.send_message(msg, ephemeral=True)
 
 
-tree.add_command(vrc_group)
+tree.add_command(movie_group)
 
 
 @client.event

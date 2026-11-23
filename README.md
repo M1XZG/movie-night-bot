@@ -13,6 +13,9 @@ own channels, ping role and timezone.
 
 ## Features
 
+All commands are grouped under `/movie`, including `/movie config` and
+`/movie vrchat`. The former hyphenated top-level commands are no longer registered.
+
 - **`/movie schedule`** — opens a form (title / year / date / time / runtime), then:
   - creates a Discord scheduled event (with a 16:9 backdrop image when found), and
   - posts a styled announcement, optionally pinging a configurable role.
@@ -27,7 +30,7 @@ own channels, ping role and timezone.
     18:00–04:59. Default type is Movie.)
   - A **`vrchat`** option (default *yes* when a VRChat group is linked) — set
     `vrchat:False` for a Discord-only watch party that skips the VRChat event.
-- **`/movie-test`** — dry-run that verifies config and all required permissions
+- **`/movie test`** — dry-run that verifies config and all required permissions
   (Manage Events, channel visibility, send/embed/attach, ping role) **without**
   posting anything. Run this before the first real `/movie schedule`.
 - **`/movie unfuck`** — in the mod channel, pick a bot-managed upcoming booking
@@ -39,10 +42,10 @@ own channels, ping role and timezone.
   alone. Identity repairs replace the film details and Discord ratings but never
   move the booking. No fresh announcements, role pings or calendar events are
   created. After a partial failure, retry just the unfinished steps.
-- **`/movie-cancel`** — autocompletes this server's upcoming movie nights and
+- **`/movie cancel`** — autocompletes this server's upcoming movie nights and
   deletes **both** the scheduled event and the announcement message.
-- **`/movie-help`** — posts an ephemeral guide listing every command and what it does.
-- **`/movie-config set | show | clear`** — per-guild configuration.
+- **`/movie help`** — posts an ephemeral guide listing every command and what it does.
+- **`/movie config set | show | clear`** — per-guild configuration.
 - **AI content** via the [GitHub Copilot CLI](https://github.com/github/copilot-cli):
   optional generic invitation copy, with no tool use or film research. The
   synopsis and people come from verified TMDB metadata. A failed lookup uses
@@ -58,7 +61,7 @@ own channels, ping role and timezone.
   means the critics' score, not the audience score. These scores are fetched
   separately from the AI copy and are never added to VRChat event descriptions.
 - **VRChat group calendar (optional):** if a server links a VRChat group, each
-  movie night also creates a **VRChat group calendar event**, and `/movie-cancel`
+  movie night also creates a **VRChat group calendar event**, and `/movie cancel`
   removes it too. See [VRChat integration](#vrchat-integration-optional).
 
 ---
@@ -257,7 +260,7 @@ non-zero exit status and explain the error on stderr.
 
 Backdrops are supplied by [The Movie Database](https://www.themoviedb.org).
 This product uses the TMDB API but is not endorsed or certified by TMDB.
-The bot's `/movie-help` includes the same credit and logo. The PNG is rendered
+The bot's `/movie help` includes the same credit and logo. The PNG is rendered
 from TMDB's [approved blue short logo](https://www.themoviedb.org/assets/v4/logos/v2/blue_short-8e7b30f73a4020692ccca9c88bafe5dcb6f8a62a4c6bc55cd9ba82bb2cd95f6c.svg)
 without changing its colours or proportions.
 
@@ -295,20 +298,20 @@ A mod with **Manage Events** runs, in the channel that should become the mod
 channel:
 
 ```
-/movie-config set mod_channel:#mods announce_channel:#announcements voice_channel:🔊 Movie Night ping_role:@Movie Pings timezone:Europe/London
+/movie config set mod_channel:#mods announce_channel:#announcements voice_channel:🔊 Movie Night ping_role:@Movie Pings timezone:Europe/London
 ```
 
 Then check it:
 
 ```
-/movie-config show
+/movie config show
 ```
 
 To create the Discord event (and VRChat event) **without** posting an
 announcement — e.g. an events-only server — turn announcements off:
 
 ```
-/movie-config set announcements:False
+/movie config set announcements:False
 ```
 
 Set `announcements:True` to turn posting back on. The announcements channel is
@@ -326,7 +329,7 @@ Now schedule one (must be run in the configured mod channel):
 …and cancel if needed:
 
 ```
-/movie-cancel   # pick from the autocomplete list
+/movie cancel   # pick from the autocomplete list
 ```
 
 ### Config options
@@ -353,7 +356,7 @@ Now schedule one (must be run in the configured mod channel):
 ## Security notes
 
 - Slash commands are gated with `default_permissions(manage_events=True)` and
-  `guild_only()`; `/movie schedule` and `/movie-cancel` are additionally restricted to
+  `guild_only()`; `/movie schedule` and `/movie cancel` are additionally restricted to
   the configured mod channel.
 - The bot requests **no privileged intents** and uses `Intents.none()` +
   `guilds`. It never reads message content.
@@ -372,7 +375,7 @@ a matching event on that group's **calendar** — and remove it when you cancel.
 VRChat has **no OAuth**, so the only way to get a session is username + password
 + 2FA. Linking is therefore a one-time, self-service flow per server:
 
-1. A mod runs **`/movie-vrchat link`**.
+1. A mod runs **`/movie vrchat link`**.
 2. A modal asks for the VRChat **username**, **password**, **group ID**
    (`grp_…`) and an optional event **category** (default `film_media`).
 3. If the account has 2FA, the bot replies with an *Enter 2FA code* button →
@@ -382,7 +385,7 @@ VRChat has **no OAuth**, so the only way to get a session is username + password
 
 ```mermaid
 flowchart TD
-    A[/movie-vrchat link/] --> B[Modal: username, password, group ID, category]
+    A[/movie vrchat link/] --> B[Modal: username, password, group ID, category]
     B --> C{2FA required?}
     C -- no --> E[Store session cookies]
     C -- yes --> D[Button → 2FA code modal → verify]
@@ -394,15 +397,15 @@ flowchart TD
 
 | Command | What it does |
 | --- | --- |
-| `/movie-vrchat link` | start the credential + 2FA flow (one-time per server) |
-| `/movie-vrchat status` | show the linked account/group and check if the session is still valid |
-| `/movie-vrchat early-start` | start the VRChat event N minutes early (end time unchanged) |
-| `/movie-vrchat recover` | reconcile or resume a saved unfinished calendar booking after re-linking |
-| `/movie-vrchat unlink` | delete the stored session and group link |
+| `/movie vrchat link` | start the credential + 2FA flow (one-time per server) |
+| `/movie vrchat status` | show the linked account/group and check if the session is still valid |
+| `/movie vrchat early-start` | start the VRChat event N minutes early (end time unchanged) |
+| `/movie vrchat recover` | reconcile or resume a saved unfinished calendar booking after re-linking |
+| `/movie vrchat unlink` | delete the stored session and group link |
 
 Once linked, every `/movie schedule` also creates a VRChat group calendar event
 (`POST /calendar/{groupId}/event`) using the movie's title, verified synopsis, and
-start/end times; `/movie-cancel` deletes it (`DELETE /calendar/{groupId}/{calendarId}`).
+start/end times; `/movie cancel` deletes it (`DELETE /calendar/{groupId}/{calendarId}`).
 Pass `vrchat:False` on `/movie schedule` to skip the VRChat event for a single
 Discord-only watch party.
 
@@ -415,7 +418,7 @@ successful. Both fields are required for reliable in-client start notifications.
 
 **Early start (optional).** VRChat only fires its "event starting soon"
 announcement when the event begins, so the notice can arrive after the movie has
-already started. Run `/movie-vrchat early-start minutes:10` to bring the VRChat
+already started. Run `/movie vrchat early-start minutes:10` to bring the VRChat
 event's **start** forward by that many minutes (0 disables, max 60) — the **end
 time is left unchanged**. Example: a 19:00 movie creates a VRChat event that
 starts at 18:50 and still ends at the movie's real finish, so VRChat's heads-up
@@ -440,7 +443,7 @@ group banner. (Requires `Pillow` — see `requirements.txt`.)
 - The linked VRChat account must be a **member of the group with permission to
   manage calendar events**.
 - Uploaded event images are owned by the **linked user account** (they appear in
-  that account's gallery/files) and are removed on `/movie-cancel`.
+  that account's gallery/files) and are removed on `/movie cancel`.
 - The VRChat API is **unofficial**. The bot sends a descriptive `User-Agent`
   and makes only occasional calls; respect VRChat's rate limits and Terms.
 - Session cookies expire eventually. Refresh the link, then explicitly recover
@@ -462,8 +465,8 @@ To recover a new booking missed during expired VRChat authentication, refresh
 the link and select the saved booking:
 
 ```text
-/movie-vrchat link
-/movie-vrchat recover
+/movie vrchat link
+/movie vrchat recover
 ```
 
 Recovery reconciles an uncertain POST before doing anything else. It never
