@@ -81,7 +81,7 @@ class SchedulingReliabilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(rec["vrc_state"], "failed")
         self.assertNotIn("vrc_event_id", rec)
         self.assertEqual(rec["vrc_payload"]["title"], "Movie Night: A Film")
-        self.assertIn("/movie-vrchat recover", interaction.followup.send.await_args.args[0])
+        self.assertIn("/movie vrchat recover", interaction.followup.send.await_args.args[0])
 
     async def test_unwritable_index_prevents_external_writes(self):
         guild, announce, create_vrc, interaction, records, _ = await self.schedule(save_error=True)
